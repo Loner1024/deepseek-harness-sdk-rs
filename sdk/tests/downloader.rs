@@ -10,8 +10,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use deepseek_harness_sdk::runtime::{ResolveOptions, resolve};
-use deepseek_harness_sdk::{DeepSeekHarness, DeepSeekHarnessConfig, RunOptions, SdkError};
+use deepseek_harness_sdk_rs::runtime::{ResolveOptions, resolve};
+use deepseek_harness_sdk_rs::{DeepSeekHarness, DeepSeekHarnessConfig, RunOptions, SdkError};
 
 fn build_wheel(exe_name: &str, exe_bytes: &[u8], macos: bool) -> Vec<u8> {
     let mut buffer = Cursor::new(Vec::new());
@@ -256,7 +256,7 @@ async fn zero_config_injects_the_extracted_default_config() {
     harness.start().await.expect("start");
     let info = harness
         .client()
-        .initialize(&deepseek_harness_sdk::InitializeParams {
+        .initialize(&deepseek_harness_sdk_rs::InitializeParams {
             cwd: std::env::current_dir().expect("cwd"),
             provider: "p".to_string(),
             model: "m".to_string(),
@@ -294,7 +294,7 @@ async fn explicit_launch_skips_default_config_injection() {
     harness.start().await.expect("start");
     let info = harness
         .client()
-        .initialize(&deepseek_harness_sdk::InitializeParams {
+        .initialize(&deepseek_harness_sdk_rs::InitializeParams {
             cwd: std::env::current_dir().expect("cwd"),
             provider: "p".to_string(),
             model: "m".to_string(),

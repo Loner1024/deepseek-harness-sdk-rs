@@ -5,7 +5,7 @@ mod common;
 
 use std::time::Duration;
 
-use deepseek_harness_sdk::{HarnessClient, InitializeParams, SdkError};
+use deepseek_harness_sdk_rs::{HarnessClient, InitializeParams, SdkError};
 use serde_json::json;
 
 fn initialize_params() -> InitializeParams {
@@ -19,8 +19,8 @@ fn initialize_params() -> InitializeParams {
 
 /// Await one notification or panic with the pending error after 5 seconds.
 async fn next_notification(
-    subscription: &mut deepseek_harness_sdk::NotificationSubscription,
-) -> deepseek_harness_sdk::Notification {
+    subscription: &mut deepseek_harness_sdk_rs::NotificationSubscription,
+) -> deepseek_harness_sdk_rs::Notification {
     tokio::time::timeout(Duration::from_secs(5), subscription.next())
         .await
         .expect("notification did not arrive in time")
@@ -36,7 +36,10 @@ async fn initialize_handshake_reports_server_info() {
         .await
         .expect("initialize");
     let info = result.server_info.expect("serverInfo present");
-    assert_eq!(info.name.as_deref(), Some("deepseek-harness-sdk-runtime"));
+    assert_eq!(
+        info.name.as_deref(),
+        Some("deepseek-harness-sdk-rs-runtime")
+    );
     assert_eq!(info.version.as_deref(), Some("0.0.1"));
     client.close().await;
 }

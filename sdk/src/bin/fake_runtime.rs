@@ -66,9 +66,9 @@ async fn main() {
                 let server_info = if scenario == "env" {
                     let config =
                         std::env::var("DSH_CORDIS_CONFIG").unwrap_or_else(|_| "unset".to_string());
-                    json!({"serverInfo": {"name": "deepseek-harness-sdk-runtime", "version": config}})
+                    json!({"serverInfo": {"name": "deepseek-harness-sdk-rs-runtime", "version": config}})
                 } else {
-                    json!({"serverInfo": {"name": "deepseek-harness-sdk-runtime", "version": "0.0.1"}})
+                    json!({"serverInfo": {"name": "deepseek-harness-sdk-rs-runtime", "version": "0.0.1"}})
                 };
                 respond(&mut stdout, &id, server_info);
                 match scenario.as_str() {

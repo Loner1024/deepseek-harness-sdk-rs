@@ -8,16 +8,16 @@
 
 | 目录 | Crate | 职责 |
 |---|---|---|
-| [sdk](sdk/README.md) | `deepseek-harness-sdk` | 高层轮次 API、低层 JSON-RPC 客户端与运行时下载器 |
+| [sdk](sdk/README.md) | `deepseek-harness-sdk-rs` | 高层轮次 API、低层 JSON-RPC 客户端与运行时下载器 |
 
 ## 行为
 
 SDK 惰性启动运行时，并在多次 `run()` 调用间持有它。未给任何显式启动通道时，默认开启的 `runtime-download` feature 从 PyPI 风格的索引拉取平台运行时 wheel、校验摘要并缓存可执行程序；显式指定 `runtime_bin` 或 `command`/`args` 的调用方可以关闭该 feature。[SDK 参考](sdk/README.md)覆盖生命周期、结果、通知、运行时选择、配置与错误。
 
-## 上游
+## 与 DeepSeek Harness 的关系
 
-本仓库是从 [deepseek-harness](https://github.com/deepseek-ai/deepseek-harness)（`rust/` 目录）抽取的 Rust SDK。规范的贡献流程是向上游仓库提 PR；`deepseek-harness-sdk` crate 名的 crates.io 发布也归上游所有。
+本仓库是 Rust SDK 的独立主仓库。SDK 驱动的运行时是 [DeepSeek Harness 项目](https://github.com/deepseek-ai/deepseek-harness)以 `deepseek-harness-runtime-bin` 发布的单文件可执行程序；SDK 遵循该运行时文档化的 stdio JSON-RPC 协议，并为测试固定自己的运行时 wheel 版本。贡献以本仓库的 PR 形式进行；`deepseek-harness-sdk-rs` 的 crates.io 发布也由本仓库通过 Trusted Publishing 负责。
 
 ## 贡献者工作流
 
-用 `cargo fmt --all`、`cargo clippy --all-targets --features test-support -- -D warnings` 与 `cargo test --features test-support` 构建和测试；`test-support` feature 构建机制层测试所驱动的 `dsh-fake-runtime` 二进制。无密钥 smoke 测试在缺少运行时环境变量时自行跳过；上游仓库的 CI 会针对真实运行时可执行程序驱动它。
+用 `cargo fmt --all`、`cargo clippy --all-targets --features test-support -- -D warnings` 与 `cargo test --features test-support` 构建和测试；`test-support` feature 构建机制层测试所驱动的 `dsh-fake-runtime` 二进制。CI 会对从 PyPI 下载的真实运行时可执行程序跑无密钥 smoke 层；本地缺少运行时环境变量时该测试自行跳过。

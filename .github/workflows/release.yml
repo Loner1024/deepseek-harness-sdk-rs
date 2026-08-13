@@ -1,0 +1,96 @@
+name: Release
+
+# Publication runs from a manual workflow_dispatch on the matching v* tag
+# through the crates-io environment, which gates approval and carries the
+# crates.io Trusted Publishing identity (the workflow exchanges the GitHub
+# OIDC token for a short-lived crates.io token; no long-lived secret exists).
+# A PR labeled release-dry-run validates the crate without registry
+# credentials.
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish deepseek-harness-sdk-rs to crates.io. Must run from a v* tag matching the Cargo.toml version.
+        required: true
+        type: boolean
+        default: false
+  pull_request:
+    types: [labeled]
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: ${{ github.event_name == 'workflow_dispatch' && inputs.publish && 'crates-publication' || format('{0}-{1}', github.workflow, github.ref) }}
+  cancel-in-progress: false
+
+jobs:
+  version:
+    name: Resolve release version
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Resolve release version
+        id: version
+        run: |
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml)"
+          [ -n "$version" ] || { echo "::error::Cargo.toml has no version"; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  validate:
+    name: Validate release candidate
+    if: github.event_name == 'workflow_dispatch' || github.event.label.name == 'release-dry-run'
+    needs: version
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Dry-run publish
+        run: cargo publish -p deepseek-harness-sdk-rs --dry-run
+
+  publish:
+    name: Publish to crates.io
+    if: github.event_name == 'workflow_dispatch' && inputs.publish
+    needs: [version, validate]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: crates-io
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Authorize publication request
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          [ "$REF_TYPE" = tag ] && [ "$REF_NAME" = "v$VERSION" ] || {
+            echo "::error::Publication must run from tag v$VERSION."
+            exit 1
+          }
+
+      # Exchanges the GitHub OIDC token for a short-lived crates.io token; the
+      # action's post-step revokes it.
+      - name: Authenticate (Trusted Publishing)
+        id: auth
+        uses: rust-lang/crates-io-auth-action@bbd81622f20ce9e2dd9622e3218b975523e45bbe # v1.0.4 (sha-pinned)
+
+      - name: Use Trusted Publishing token
+        if: steps.auth.outputs.token != ''
+        run: echo "CARGO_REGISTRY_TOKEN=${{ steps.auth.outputs.token }}" >> "$GITHUB_ENV"
+
+      - name: Publish
+        run: cargo publish -p deepseek-harness-sdk-rs

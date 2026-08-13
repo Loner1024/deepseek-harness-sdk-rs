@@ -1,4 +1,4 @@
-//! # deepseek-harness-sdk
+//! # deepseek-harness-sdk-rs
 //!
 //! Drive a DeepSeek Harness runtime from Rust. The SDK spawns the runtime as
 //! a subprocess and speaks the line-delimited JSON-RPC 2.0 protocol over its
@@ -7,9 +7,9 @@
 //! [Python SDK](../../../python/README.md).
 //!
 //! ```no_run
-//! use deepseek_harness_sdk::{DeepSeekHarness, DeepSeekHarnessConfig, RunOptions};
+//! use deepseek_harness_sdk_rs::{DeepSeekHarness, DeepSeekHarnessConfig, RunOptions};
 //!
-//! # async fn example() -> Result<(), deepseek_harness_sdk::SdkError> {
+//! # async fn example() -> Result<(), deepseek_harness_sdk_rs::SdkError> {
 //! let harness = DeepSeekHarness::new(DeepSeekHarnessConfig::default());
 //! let result = harness.run("say hi", &RunOptions::default()).await?;
 //! println!("{}", result.final_response);

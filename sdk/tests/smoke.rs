@@ -12,7 +12,7 @@ use std::net::TcpListener;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use deepseek_harness_sdk::{DeepSeekHarness, DeepSeekHarnessConfig, RunOptions};
+use deepseek_harness_sdk_rs::{DeepSeekHarness, DeepSeekHarnessConfig, RunOptions};
 use serde_json::json;
 
 const EXPECTED: &str = "rust sdk smoke ok";

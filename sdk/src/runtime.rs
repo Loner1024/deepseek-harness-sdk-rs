@@ -70,7 +70,7 @@ pub fn resolve(options: &ResolveOptions) -> Result<ResolvedRuntime, SdkError> {
         .cache_dir
         .clone()
         .or_else(|| std::env::var_os("DSH_RUNTIME_CACHE_DIR").map(PathBuf::from))
-        .or_else(|| dirs::cache_dir().map(|dir| dir.join("deepseek-harness-sdk")))
+        .or_else(|| dirs::cache_dir().map(|dir| dir.join("deepseek-harness-sdk-rs")))
         .ok_or_else(|| SdkError::RuntimeResolve {
             message: "no cache directory for the runtime download; set $DSH_RUNTIME_CACHE_DIR"
                 .into(),

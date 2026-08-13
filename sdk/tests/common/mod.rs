@@ -1,7 +1,7 @@
 //! Shared helpers for the SDK integration tests.
 #![allow(dead_code)]
 
-use deepseek_harness_sdk::HarnessClientOptions;
+use deepseek_harness_sdk_rs::HarnessClientOptions;
 
 /// Absolute path of the `dsh-fake-runtime` test binary.
 ///

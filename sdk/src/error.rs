@@ -54,7 +54,7 @@ pub enum SdkError {
         source: Arc<std::io::Error>,
     },
     /// The blocking facade was called from inside an async runtime context.
-    #[error("the deepseek-harness-sdk sync API cannot be called from within an async runtime")]
+    #[error("the deepseek-harness-sdk-rs sync API cannot be called from within an async runtime")]
     NestedRuntime,
     /// Runtime acquisition (the downloader) failed.
     #[error("{message}")]

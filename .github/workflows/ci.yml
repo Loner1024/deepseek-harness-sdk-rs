@@ -1,9 +1,9 @@
 name: CI
 
 # Format, clippy, and the fake-runtime test suite on both supported
-# platforms. The keyless smoke test self-skips without the runtime
-# environment variables; the upstream deepseek-harness repository drives it
-# against the real runtime executable.
+# platforms, plus a keyless smoke that drives the real runtime executable
+# resolved through the SDK's own downloader. Locally the smoke self-skips
+# without the runtime environment variables.
 
 on:
   push:
@@ -45,3 +45,39 @@ jobs:
 
       - name: Test
         run: cargo test --features test-support
+
+  smoke:
+    name: Keyless smoke against the real runtime (ubuntu)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      # Pinned to the runtime wheel the smoke scenario was written against;
+      # bump together with the runtime release.
+      DSH_RUNTIME_VERSION: 0.1.0rc6
+      DSH_RUNTIME_CACHE_DIR: /tmp/dsh-runtime-cache
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+
+      - name: Resolve the runtime through the downloader
+        id: runtime
+        run: |
+          cargo run --package deepseek-harness-sdk-rs --example resolve > "$RUNNER_TEMP/resolve.out"
+          cat "$RUNNER_TEMP/resolve.out"
+          echo "exe=$(sed -n 's/^exe=//p' "$RUNNER_TEMP/resolve.out")" >> "$GITHUB_OUTPUT"
+          echo "cordis=$(sed -n 's/^cordis=//p' "$RUNNER_TEMP/resolve.out")" >> "$GITHUB_OUTPUT"
+
+      - name: Keyless smoke
+        env:
+          DSH_TEST_RUNTIME_EXE: ${{ steps.runtime.outputs.exe }}
+          DSH_TEST_CORDIS_CONFIG: ${{ steps.runtime.outputs.cordis }}
+        run: cargo test --features test-support --test smoke

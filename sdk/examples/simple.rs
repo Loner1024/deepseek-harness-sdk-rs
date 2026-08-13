@@ -6,10 +6,10 @@
 //! ```sh
 //! export DEEPSEEK_API_KEY=sk-your-key-here
 //! # export DEEPSEEK_BASE_URL=http://127.0.0.1:8000/v1
-//! cargo run --package deepseek-harness-sdk --example simple -- "Inspect this directory."
+//! cargo run --package deepseek-harness-sdk-rs --example simple -- "Inspect this directory."
 //! ```
 
-use deepseek_harness_sdk::{DeepSeekHarness, DeepSeekHarnessConfig, RunOptions, SdkError};
+use deepseek_harness_sdk_rs::{DeepSeekHarness, DeepSeekHarnessConfig, RunOptions, SdkError};
 
 #[tokio::main]
 async fn main() -> Result<(), SdkError> {

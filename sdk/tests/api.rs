@@ -6,7 +6,7 @@ mod common;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use deepseek_harness_sdk::{
+use deepseek_harness_sdk_rs::{
     DeepSeekHarness, DeepSeekHarnessConfig, DeepSeekHarnessSync, RunOptions, SdkError,
 };
 use serde_json::json;

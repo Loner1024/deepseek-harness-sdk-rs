@@ -1,4 +1,4 @@
-# deepseek-harness-sdk
+# deepseek-harness-sdk-rs
 
 [English](README.md) | 中文
 
@@ -15,10 +15,10 @@ macOS（arm64）与 Linux（x64、arm64），与运行时 wheel 标签一致。W
 ## 用法
 
 ```rust,no_run
-use deepseek_harness_sdk::{DeepSeekHarness, DeepSeekHarnessConfig, RunOptions};
+use deepseek_harness_sdk_rs::{DeepSeekHarness, DeepSeekHarnessConfig, RunOptions};
 
 #[tokio::main]
-async fn main() -> Result<(), deepseek_harness_sdk::SdkError> {
+async fn main() -> Result<(), deepseek_harness_sdk_rs::SdkError> {
     let harness = DeepSeekHarness::new(DeepSeekHarnessConfig::default());
     let result = harness.run("say hi", &RunOptions::default()).await?;
     println!("{}", result.final_response);
@@ -32,13 +32,13 @@ async fn main() -> Result<(), deepseek_harness_sdk::SdkError> {
 ### 阻塞门面
 
 ```rust,no_run
-use deepseek_harness_sdk::{DeepSeekHarnessConfig, DeepSeekHarnessSync, RunOptions};
+use deepseek_harness_sdk_rs::{DeepSeekHarnessConfig, DeepSeekHarnessSync, RunOptions};
 
 let sync = DeepSeekHarnessSync::new(DeepSeekHarnessConfig::default())?;
 let result = sync.run("say hi", &RunOptions::default())?;
 println!("{}", result.final_response);
 sync.close()?;
-# Ok::<(), deepseek_harness_sdk::SdkError>(())
+# Ok::<(), deepseek_harness_sdk_rs::SdkError>(())
 ```
 
 `DeepSeekHarnessSync` 不得在异步运行时上下文内调用；否则以 `SdkError::NestedRuntime` 失败。
@@ -49,7 +49,7 @@ sync.close()?;
 
 ```rust,no_run
 use std::path::PathBuf;
-use deepseek_harness_sdk::{DeepSeekHarness, DeepSeekHarnessConfig};
+use deepseek_harness_sdk_rs::{DeepSeekHarness, DeepSeekHarnessConfig};
 
 let harness = DeepSeekHarness::new(DeepSeekHarnessConfig {
     runtime_bin: Some(PathBuf::from("/path/to/dsh-jsonrpc-agent-pkg-macos-arm64")),
@@ -84,7 +84,7 @@ cargo clippy --all-targets --features test-support -- -D warnings
 cargo test --features test-support
 ```
 
-`test-support` feature 构建 `dsh-fake-runtime` 测试二进制，机制层测试经真实管道驱动它；必须带该 feature 运行测试，否则进程级测试会以指引信息失败。无密钥 smoke 层（真实 exe 对脚本化模型）在缺少 `DSH_TEST_RUNTIME_EXE` 时自行跳过；由上游仓库的 CI 驱动。
+`test-support` feature 构建 `dsh-fake-runtime` 测试二进制，机制层测试经真实管道驱动它；必须带该 feature 运行测试，否则进程级测试会以指引信息失败。无密钥 smoke 层（真实 exe 对脚本化模型）在缺少 `DSH_TEST_RUNTIME_EXE` 时自行跳过；CI 会对从 PyPI 下载的运行时 wheel 驱动它。
 
 ## 已知限制与暂缓事项
 

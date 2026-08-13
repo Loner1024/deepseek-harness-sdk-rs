@@ -51,7 +51,7 @@ pub struct InitializeResult {
 /// The `serverInfo` object of the initialize handshake.
 #[derive(Debug, Clone)]
 pub struct ServerInfo {
-    /// Server identity; the protocol value is `deepseek-harness-sdk-runtime`.
+    /// Server identity; the protocol value is `deepseek-harness-sdk-rs-runtime`.
     pub name: Option<String>,
     /// Server version.
     pub version: Option<String>,

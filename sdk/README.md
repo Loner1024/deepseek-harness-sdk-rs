@@ -1,4 +1,4 @@
-# deepseek-harness-sdk
+# deepseek-harness-sdk-rs
 
 English | [中文](README.zh.md)
 
@@ -15,10 +15,10 @@ macOS (arm64) and Linux (x64, arm64), matching the runtime wheel tags. Windows i
 ## Usage
 
 ```rust,no_run
-use deepseek_harness_sdk::{DeepSeekHarness, DeepSeekHarnessConfig, RunOptions};
+use deepseek_harness_sdk_rs::{DeepSeekHarness, DeepSeekHarnessConfig, RunOptions};
 
 #[tokio::main]
-async fn main() -> Result<(), deepseek_harness_sdk::SdkError> {
+async fn main() -> Result<(), deepseek_harness_sdk_rs::SdkError> {
     let harness = DeepSeekHarness::new(DeepSeekHarnessConfig::default());
     let result = harness.run("say hi", &RunOptions::default()).await?;
     println!("{}", result.final_response);
@@ -32,13 +32,13 @@ The runtime subprocess starts lazily on the first `run()` and stays owned by the
 ### Blocking facade
 
 ```rust,no_run
-use deepseek_harness_sdk::{DeepSeekHarnessConfig, DeepSeekHarnessSync, RunOptions};
+use deepseek_harness_sdk_rs::{DeepSeekHarnessConfig, DeepSeekHarnessSync, RunOptions};
 
 let sync = DeepSeekHarnessSync::new(DeepSeekHarnessConfig::default())?;
 let result = sync.run("say hi", &RunOptions::default())?;
 println!("{}", result.final_response);
 sync.close()?;
-# Ok::<(), deepseek_harness_sdk::SdkError>(())
+# Ok::<(), deepseek_harness_sdk_rs::SdkError>(())
 ```
 
 `DeepSeekHarnessSync` must not be called from inside an async runtime; doing so fails with `SdkError::NestedRuntime`.
@@ -49,7 +49,7 @@ Callers who spawn their own runtime skip the downloader entirely:
 
 ```rust,no_run
 use std::path::PathBuf;
-use deepseek_harness_sdk::{DeepSeekHarness, DeepSeekHarnessConfig};
+use deepseek_harness_sdk_rs::{DeepSeekHarness, DeepSeekHarnessConfig};
 
 let harness = DeepSeekHarness::new(DeepSeekHarnessConfig {
     runtime_bin: Some(PathBuf::from("/path/to/dsh-jsonrpc-agent-pkg-macos-arm64")),
@@ -84,7 +84,7 @@ cargo clippy --all-targets --features test-support -- -D warnings
 cargo test --features test-support
 ```
 
-The `test-support` feature builds the `dsh-fake-runtime` test binary that the mechanism-tier tests drive through real pipes; run the tests with the feature enabled or the process-level tests fail with guidance. The keyless smoke tier (the real exe against a scripted model) self-skips without `DSH_TEST_RUNTIME_EXE`; the upstream repository's CI drives it.
+The `test-support` feature builds the `dsh-fake-runtime` test binary that the mechanism-tier tests drive through real pipes; run the tests with the feature enabled or the process-level tests fail with guidance. The keyless smoke tier (the real exe against a scripted model) self-skips without `DSH_TEST_RUNTIME_EXE`; CI drives it against the runtime wheel downloaded from PyPI.
 
 ## Known limitations and deferred work
 
