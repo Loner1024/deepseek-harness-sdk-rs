@@ -1,0 +1,51 @@
+[package]
+name = "deepseek-harness-sdk"
+description = "Rust SDK for DeepSeek Harness: drive the harness JSON-RPC runtime as a subprocess"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords = ["deepseek", "harness", "agent", "json-rpc", "sdk"]
+categories = ["development-tools", "api-bindings"]
+readme = "README.md"
+
+[features]
+default = ["runtime-download"]
+# Fetches the platform runtime wheel from a PyPI index, verifies its SHA-256
+# digest, and extracts the executable into a versioned cache. Disable it when
+# every launch is explicit (`command`/`args` or `runtime_bin`).
+runtime-download = ["dep:ureq", "dep:zip", "dep:sha2", "dep:hex", "dep:dirs"]
+# Builds the dsh-fake-runtime test binary; tests run `cargo test --features test-support`.
+test-support = []
+
+[[bin]]
+name = "dsh-fake-runtime"
+path = "src/bin/fake_runtime.rs"
+required-features = ["test-support"]
+
+[dependencies]
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["io-util", "macros", "process", "rt", "sync", "time"] }
+uuid = { version = "1", features = ["v4"] }
+dirs = { version = "6", optional = true }
+hex = { version = "0.4", optional = true }
+sha2 = { version = "0.10", optional = true }
+ureq = { version = "3", optional = true }
+zip = { version = "2", default-features = false, features = ["deflate"], optional = true }
+
+[dev-dependencies]
+hex = "0.4"
+sha2 = "0.10"
+tempfile = "3"
+tokio = { version = "1", features = ["full", "test-util"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+all = "warn"

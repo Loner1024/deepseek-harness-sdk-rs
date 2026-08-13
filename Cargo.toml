@@ -1,0 +1,12 @@
+[workspace]
+members = ["sdk"]
+resolver = "2"
+
+[workspace.package]
+# Sentinel version: the crates.io release staging replaces it with the
+# repository version (root package.json), mirroring the Python release staging.
+version = "0.0.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/Loner1024/deepseek-harness-sdk-rs"
+homepage = "https://github.com/Loner1024/deepseek-harness-sdk-rs"
