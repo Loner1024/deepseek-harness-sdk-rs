@@ -20,7 +20,7 @@ The SDK launches the runtime lazily and owns it across `run()` calls. With no ex
 |---|---|
 | `simple` | Zero-config one-task run. |
 | `resolve` | Resolve the platform runtime through the downloader and print its paths. |
-| `deep_research` | Deep research: `web_search`/`web_fetch` plus the subagent tool, with subagent reports rendered from the notification stream. |
+| `deep_research` | Deep research: `web_search`/`web_fetch` plus the subagent tool, with the report streamed token-by-token from `assistant/chunk` events. |
 
 ```sh
 export DEEPSEEK_API_KEY=sk-your-key-here
