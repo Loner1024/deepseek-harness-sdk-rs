@@ -66,6 +66,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     environment: crates-io
+    env:
+      # Bootstrap path: crates.io cannot configure Trusted Publishing for a
+      # crate that does not exist yet, so the FIRST publish authenticates
+      # with an API token secret; later publishes run the OIDC exchange.
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -83,9 +88,10 @@ jobs:
           }
 
       # Exchanges the GitHub OIDC token for a short-lived crates.io token; the
-      # action's post-step revokes it.
+      # action's post-step revokes it. Skipped on the bootstrap path.
       - name: Authenticate (Trusted Publishing)
         id: auth
+        if: env.CARGO_REGISTRY_TOKEN == ''
         uses: rust-lang/crates-io-auth-action@bbd81622f20ce9e2dd9622e3218b975523e45bbe # v1.0.4 (sha-pinned)
 
       - name: Use Trusted Publishing token
