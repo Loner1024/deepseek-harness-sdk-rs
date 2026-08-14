@@ -33,6 +33,19 @@ pub struct ResolvedRuntime {
     pub default_config: PathBuf,
 }
 
+/// Normalize a semver pre-release to PEP 440 spelling for PyPI queries:
+/// cargo spells `0.1.0-rc.6` while the wheel index spells `0.1.0rc6`.
+fn to_pypi_version(version: &str) -> String {
+    for (from, to) in [("-rc.", "rc"), ("-beta.", "b"), ("-alpha.", "a")] {
+        if let Some(pos) = version.find(from) {
+            let mut out = version.to_string();
+            out.replace_range(pos..pos + from.len(), to);
+            return out;
+        }
+    }
+    version.to_string()
+}
+
 /// Wheel tag and executable suffix for the current target.
 fn platform() -> Result<(&'static str, &'static str), SdkError> {
     match (std::env::consts::OS, std::env::consts::ARCH) {
@@ -53,11 +66,13 @@ fn platform() -> Result<(&'static str, &'static str), SdkError> {
 /// verify, and extract the platform wheel.
 pub fn resolve(options: &ResolveOptions) -> Result<ResolvedRuntime, SdkError> {
     let (wheel_tag, exe_tag) = platform()?;
-    let version = options
-        .version
-        .clone()
-        .or_else(|| std::env::var("DSH_RUNTIME_VERSION").ok())
-        .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
+    let version = to_pypi_version(
+        &options
+            .version
+            .clone()
+            .or_else(|| std::env::var("DSH_RUNTIME_VERSION").ok())
+            .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string()),
+    );
     let index = options
         .index_url
         .clone()
@@ -289,4 +304,22 @@ fn cache_valid(cache_dir: &Path, exe_path: &Path, exe_name: &str) -> bool {
         }
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::to_pypi_version;
+
+    #[test]
+    fn normalizes_pre_release_spelling() {
+        assert_eq!(to_pypi_version("0.1.0-rc.6"), "0.1.0rc6");
+        assert_eq!(to_pypi_version("0.2.0-beta.1"), "0.2.0b1");
+        assert_eq!(to_pypi_version("0.3.0-alpha.3"), "0.3.0a3");
+    }
+
+    #[test]
+    fn leaves_stable_and_pep440_versions_untouched() {
+        assert_eq!(to_pypi_version("0.1.0"), "0.1.0");
+        assert_eq!(to_pypi_version("0.1.0rc6"), "0.1.0rc6");
+    }
 }

@@ -102,7 +102,7 @@ dependencies = [
 
 [[package]]
 name = "deepseek-harness-sdk-rs"
-version = "0.1.0"
+version = "0.1.0-rc.6"
 dependencies = [
  "dirs",
  "hex",

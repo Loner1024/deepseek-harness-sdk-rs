@@ -70,7 +70,7 @@ let harness = DeepSeekHarness::new(DeepSeekHarnessConfig {
 
 ## 启动通道
 
-最显式者优先：`launch_args_override`、`command`+`args`、`runtime_bin`、`$DSH_RUNTIME_BIN`，最后是下载器。下载器读取 `$DSH_RUNTIME_PYPI_URL`（索引覆盖，默认 `https://pypi.org/pypi`）、`$DSH_RUNTIME_VERSION`（wheel 版本，默认 crate 版本）与 `$DSH_RUNTIME_CACHE_DIR`（缓存根目录，默认平台缓存目录）。只有当下载器解析出运行时且不存在非空配置时，默认 `cordis.yml` 才经 `$DSH_CORDIS_CONFIG` 注入；运行时二进制本身始终要求显式配置。
+最显式者优先：`launch_args_override`、`command`+`args`、`runtime_bin`、`$DSH_RUNTIME_BIN`，最后是下载器。crate 版本与其目标的运行时 wheel 发布对齐，并以 PEP 440 拼写（`0.1.0-rc.6` → `0.1.0rc6`）；`$DSH_RUNTIME_VERSION` 指向其他发布。下载器读取 `$DSH_RUNTIME_PYPI_URL`（索引覆盖，默认 `https://pypi.org/pypi`）、`$DSH_RUNTIME_VERSION`（wheel 版本，默认 crate 版本）与 `$DSH_RUNTIME_CACHE_DIR`（缓存根目录，默认平台缓存目录）。只有当下载器解析出运行时且不存在非空配置时，默认 `cordis.yml` 才经 `$DSH_CORDIS_CONFIG` 注入；运行时二进制本身始终要求显式配置。
 
 ## 错误
 

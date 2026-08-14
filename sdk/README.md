@@ -70,7 +70,7 @@ The low-level client: `start()`/`initialize()`/`session_prompt()`/`request()`/`n
 
 ## Launch channels
 
-Most explicit wins: `launch_args_override`, `command`+`args`, `runtime_bin`, `$DSH_RUNTIME_BIN`, then the downloader. The downloader reads `$DSH_RUNTIME_PYPI_URL` (index override, default `https://pypi.org/pypi`), `$DSH_RUNTIME_VERSION` (wheel version, default the crate version), and `$DSH_RUNTIME_CACHE_DIR` (cache root, default the platform cache directory). The default `cordis.yml` is injected via `$DSH_CORDIS_CONFIG` only when the downloader resolved the runtime and no non-empty config exists; the runtime binary itself always requires an explicit config.
+Most explicit wins: `launch_args_override`, `command`+`args`, `runtime_bin`, `$DSH_RUNTIME_BIN`, then the downloader. The crate version tracks the runtime wheel release it targets, spelled as PEP 440 (`0.1.0-rc.6` → `0.1.0rc6`); `$DSH_RUNTIME_VERSION` targets a different release. The downloader reads `$DSH_RUNTIME_PYPI_URL` (index override, default `https://pypi.org/pypi`), `$DSH_RUNTIME_VERSION` (wheel version, default the crate version), and `$DSH_RUNTIME_CACHE_DIR` (cache root, default the platform cache directory). The default `cordis.yml` is injected via `$DSH_CORDIS_CONFIG` only when the downloader resolved the runtime and no non-empty config exists; the runtime binary itself always requires an explicit config.
 
 ## Errors
 
