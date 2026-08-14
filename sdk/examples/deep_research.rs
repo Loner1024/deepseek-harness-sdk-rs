@@ -6,7 +6,7 @@
 //! main agent plans the research and delegates subtopics to subagents. This
 //! program renders the live notification stream: the main report streams
 //! token-by-token to stdout (`assistant/chunk` text deltas), each subagent's
-//! report streams on its own labeled lane, reasoning deltas go to stderr, and
+//! report streams on its own labeled lane; reasoning deltas are skipped and
 //! lifecycle transitions are logged.
 //!
 //! ```sh
@@ -162,13 +162,26 @@ fn parse_args() -> (String, Option<String>, Option<PathBuf>) {
 /// Per-session streaming lane: the root session renders bare on stdout;
 /// subagent lanes carry a `[subagent <id>]` prefix. Block and request
 /// boundaries emit line breaks so interleaved lanes stay readable.
-#[derive(Default)]
 struct Lane {
     label: Option<String>,
     step: Option<(u64, u64)>,
     block: Option<u64>,
     at_line_start: bool,
     streamed: bool,
+}
+
+impl Default for Lane {
+    fn default() -> Self {
+        Self {
+            label: None,
+            step: None,
+            block: None,
+            // A lane starts at the beginning of a line, so the first delta
+            // prints its label once instead of before every fragment.
+            at_line_start: true,
+            streamed: false,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -289,34 +302,22 @@ fn render_chunk(payload: &Value, state: &Mutex<StreamState>) {
         }
         Some("text-delta") => {
             let text = chunk.get("text").and_then(Value::as_str).unwrap_or("");
-            emit(lane, text, false);
-        }
-        Some("reasoning-delta") => {
-            let text = chunk.get("text").and_then(Value::as_str).unwrap_or("");
-            emit(lane, text, true);
+            emit(lane, text);
         }
         _ => {}
     }
 }
 
-/// Write one delta to the lane: the lane label opens the line, reasoning
-/// deltas go to stderr with a marker, and the stream flushes per delta.
-fn emit(lane: &mut Lane, text: &str, reasoning: bool) {
-    if !lane.at_line_start {
-        if let Some(label) = &lane.label {
-            print!("{label}");
-        }
-        if reasoning {
-            eprint!("» ");
-        }
+/// Write one text delta to the lane: the lane label opens the line, and the
+/// stream flushes per delta.
+fn emit(lane: &mut Lane, text: &str) {
+    if !lane.at_line_start
+        && let Some(label) = &lane.label
+    {
+        print!("{label}");
     }
-    if reasoning {
-        eprint!("{text}");
-        let _ = std::io::stderr().flush();
-    } else {
-        print!("{text}");
-        let _ = std::io::stdout().flush();
-    }
+    print!("{text}");
+    let _ = std::io::stdout().flush();
     lane.streamed = true;
     lane.at_line_start = text.ends_with('\n');
 }
