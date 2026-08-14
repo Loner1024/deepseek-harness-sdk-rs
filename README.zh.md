@@ -20,7 +20,7 @@ SDK 惰性启动运行时，并在多次 `run()` 调用间持有它。未给任�
 |---|---|
 | `simple` | 零配置单任务运行。 |
 | `resolve` | 通过下载器解析平台运行时并打印路径。 |
-| `deep_research` | 深度研究：`web_search`/`web_fetch` 加子代理工具，报告经 `assistant/chunk` 事件逐 token 流式渲染。 |
+| `deep_research` | 深度研究：`web_search`/`web_fetch` 加子代理工具，从通知流渲染子代理报告。 |
 
 ```sh
 export DEEPSEEK_API_KEY=sk-your-key-here
