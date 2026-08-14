@@ -14,6 +14,19 @@
 
 SDK 惰性启动运行时，并在多次 `run()` 调用间持有它。未给任何显式启动通道时，默认开启的 `runtime-download` feature 从 PyPI 风格的索引拉取平台运行时 wheel、校验摘要并缓存可执行程序；显式指定 `runtime_bin` 或 `command`/`args` 的调用方可以关闭该 feature。[SDK 参考](sdk/README.md)覆盖生命周期、结果、通知、运行时选择、配置与错误。
 
+## 示例
+
+| 示例 | 展示内容 |
+|---|---|
+| `simple` | 零配置单任务运行。 |
+| `resolve` | 通过下载器解析平台运行时并打印路径。 |
+| `deep_research` | 深度研究：`web_search`/`web_fetch` 加子代理工具，从通知流渲染子代理报告。 |
+
+```sh
+export DEEPSEEK_API_KEY=sk-your-key-here
+cargo run --example deep_research -- "self-hosted vector databases"
+```
+
 ## 与 DeepSeek Harness 的关系
 
 本仓库是 Rust SDK 的独立主仓库。SDK 驱动的运行时是 [DeepSeek Harness 项目](https://github.com/deepseek-ai/deepseek-harness)以 `deepseek-harness-runtime-bin` 发布的单文件可执行程序；SDK 遵循该运行时文档化的 stdio JSON-RPC 协议，并为测试固定自己的运行时 wheel 版本。贡献以本仓库的 PR 形式进行；`deepseek-harness-sdk-rs` 的 crates.io 发布也由本仓库通过 Trusted Publishing 负责。
