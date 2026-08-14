@@ -2,10 +2,9 @@
 //!
 //! One compact JSON frame per line: `id`+`method` frames are requests, `id`
 //! frames are responses, `method` frames are notifications. Illegal JSON lines
-//! are ignored. An incoming request without a registered handler is answered
-//! `-32601`; rejected handlers answer `-32603` (the server side implements
-//! that contract; this client never registers a handler, so every
-//! server-to-client request answers `-32601`).
+//! are ignored. Server-to-client requests queue for the caller to answer with
+//! [`Peer::respond`]/[`Peer::respond_error`], mirroring the Python SDK's
+//! reserved approval-flow surface.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -16,7 +15,7 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader
 use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::{Mutex, Notify, mpsc, oneshot};
 
-use crate::client::Notification;
+use crate::client::{IncomingRequest, Notification};
 use crate::error::SdkError;
 
 /// Runs before each notification is fanned out to subscribers; the client
@@ -44,10 +43,20 @@ enum SubMsg {
     Closed(SdkError),
 }
 
+/// One delivery on the incoming-request queue: a server-to-client request or
+/// the terminal error pushed when the runtime closes.
+enum IncomingMsg {
+    Request(IncomingRequest),
+    Closed(SdkError),
+}
+
 /// Shared state between the reader task and [`Peer`] handles.
 pub(crate) struct PeerShared {
     /// Registered subscribers; the reader task evaluates their filters.
+    /// Slot `0` is the unmatched-notification queue (`next_notification`).
     subscribers: std::sync::Mutex<HashMap<u64, SubscriberSlot>>,
+    /// Server-to-client requests, queued for `next_request`.
+    requests: mpsc::UnboundedSender<IncomingMsg>,
     /// First terminal error; set once by [`Peer::fail_closed`].
     closed_err: std::sync::Mutex<Option<SdkError>>,
     /// Fired when the reader hits EOF or a write fails; the client's monitor
@@ -61,13 +70,14 @@ struct SubscriberSlot {
 }
 
 /// The client half of the transport: request correlation, notification
-/// subscriptions, and stdin lifecycle.
+/// subscriptions, the incoming-request queue, and stdin lifecycle.
 #[derive(Clone)]
 pub(crate) struct Peer {
     pending: Pending,
     out_tx: mpsc::UnboundedSender<OutFrame>,
     shared: Arc<PeerShared>,
     request_timeout: Option<Duration>,
+    request_rx: Arc<Mutex<Option<mpsc::UnboundedReceiver<IncomingMsg>>>>,
 }
 
 impl Peer {
@@ -83,8 +93,15 @@ impl Peer {
         R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
     {
+        let (requests_tx, requests_rx) = mpsc::unbounded_channel::<IncomingMsg>();
         let shared = Arc::new(PeerShared {
-            subscribers: std::sync::Mutex::new(HashMap::new()),
+            subscribers: {
+                let mut map = HashMap::new();
+                let (tx, _rx) = mpsc::unbounded_channel::<SubMsg>();
+                map.insert(0u64, SubscriberSlot { tx, filter: None });
+                std::sync::Mutex::new(map)
+            },
+            requests: requests_tx,
             closed_err: std::sync::Mutex::new(None),
             eof: Notify::new(),
         });
@@ -93,7 +110,6 @@ impl Peer {
 
         let reader_pending = pending.clone();
         let reader_shared = shared.clone();
-        let reader_tx = out_tx.clone();
         tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
             loop {
@@ -108,22 +124,24 @@ impl Peer {
                 let Some(object) = message.as_object() else {
                     continue;
                 };
-                let id = object.get("id").map(id_key);
+                let id = object.get("id");
                 let method = object.get("method").and_then(Value::as_str);
                 match (id, method) {
-                    (Some(id), Some(_)) => {
-                        // No request handler is registered: answer -32601.
-                        let response = json_line(Map::from_iter([
-                            ("jsonrpc".to_string(), Value::from("2.0")),
-                            ("id".to_string(), Value::from(id)),
-                            (
-                                "error".to_string(),
-                                serde_json::json!({"code": -32601, "message": "no request handler"}),
-                            ),
-                        ]));
-                        let _ = reader_tx.send(OutFrame::Line(response));
+                    (Some(raw_id), Some(method)) => {
+                        let payload = object
+                            .get("params")
+                            .filter(|p| p.is_object())
+                            .cloned()
+                            .unwrap_or_else(|| Value::Object(Map::new()));
+                        let request = IncomingRequest {
+                            id: raw_id.clone(),
+                            method: method.to_string(),
+                            payload,
+                        };
+                        let _ = reader_shared.requests.send(IncomingMsg::Request(request));
                     }
                     (Some(id), None) => {
+                        let id = id_key(id);
                         let Some(sender) = reader_pending.lock().await.remove(&id) else {
                             continue;
                         };
@@ -159,11 +177,21 @@ impl Peer {
                             hook(&notification);
                         }
                         let subscribers = reader_shared.subscribers.lock().unwrap();
-                        for slot in subscribers.values() {
+                        let mut delivered = false;
+                        for (slot_id, slot) in subscribers.iter() {
+                            if *slot_id == 0 {
+                                continue;
+                            }
                             let matches = slot.filter.as_ref().is_none_or(|f| f(&notification));
                             if matches {
                                 let _ = slot.tx.send(SubMsg::Notification(notification.clone()));
+                                delivered = true;
                             }
+                        }
+                        // Notifications no subscriber matched land on the
+                        // unmatched queue, mirroring the Python SDK.
+                        if !delivered && let Some(slot) = subscribers.get(&0) {
+                            let _ = slot.tx.send(SubMsg::Notification(notification));
                         }
                     }
                     (None, None) => continue,
@@ -194,7 +222,73 @@ impl Peer {
             out_tx,
             shared,
             request_timeout,
+            request_rx: Arc::new(Mutex::new(Some(requests_rx))),
         }
+    }
+
+    /// Wait for the next server-to-client request queued by the reader task.
+    pub(crate) async fn next_request(&self) -> Result<IncomingRequest, SdkError> {
+        let mut guard = self.request_rx.lock().await;
+        let receiver = guard
+            .as_mut()
+            .expect("the incoming-request receiver lives for the peer's lifetime");
+        match receiver.recv().await {
+            Some(IncomingMsg::Request(request)) => Ok(request),
+            Some(IncomingMsg::Closed(error)) => Err(error),
+            None => Err(self.closed_error().unwrap_or_else(|| {
+                SdkError::transport_closed("DeepSeek Harness runtime closed", None, &[])
+            })),
+        }
+    }
+
+    /// Answer a server-to-client request with a result frame.
+    pub(crate) fn respond(&self, id: &Value, result: Value) -> Result<(), SdkError> {
+        if let Some(err) = self.closed_error() {
+            return Err(err);
+        }
+        let frame = Map::from_iter([
+            ("jsonrpc".to_string(), Value::from("2.0")),
+            ("id".to_string(), id.clone()),
+            ("result".to_string(), result),
+        ]);
+        self.send_frame(frame)
+    }
+
+    /// Answer a server-to-client request with an error frame.
+    pub(crate) fn respond_error(
+        &self,
+        id: &Value,
+        code: i64,
+        message: &str,
+        data: Option<Value>,
+    ) -> Result<(), SdkError> {
+        if let Some(err) = self.closed_error() {
+            return Err(err);
+        }
+        let mut error = Map::from_iter([
+            ("code".to_string(), Value::from(code)),
+            ("message".to_string(), Value::from(message)),
+        ]);
+        if let Some(data) = data {
+            error.insert("data".to_string(), data);
+        }
+        let frame = Map::from_iter([
+            ("jsonrpc".to_string(), Value::from("2.0")),
+            ("id".to_string(), id.clone()),
+            ("error".to_string(), Value::Object(error)),
+        ]);
+        self.send_frame(frame)
+    }
+
+    /// Write one response frame to the runtime's stdin.
+    fn send_frame(&self, frame: Map<String, Value>) -> Result<(), SdkError> {
+        let frame = serde_json::to_string(&frame).expect("json value serialization cannot fail");
+        if self.out_tx.send(OutFrame::Line(frame)).is_err() {
+            return Err(self.closed_error().unwrap_or_else(|| {
+                SdkError::transport_closed("DeepSeek Harness runtime stdin closed", None, &[])
+            }));
+        }
+        Ok(())
     }
 
     /// Send a request frame and await its response, honoring the configured
@@ -300,6 +394,26 @@ impl Peer {
         }
     }
 
+    /// Subscribe to the unmatched-notification queue (slot `0`): notifications
+    /// no other subscriber matched. The returned subscription is permanent; it
+    /// does not unregister on drop.
+    pub(crate) fn subscribe_default(&self) -> NotificationSubscription {
+        let (tx, rx) = mpsc::unbounded_channel();
+        {
+            let mut subscribers = self.shared.subscribers.lock().unwrap();
+            let slot = subscribers
+                .get_mut(&0)
+                .expect("the unmatched queue exists for the peer's lifetime");
+            slot.tx = tx;
+        }
+        NotificationSubscription {
+            rx,
+            shared: self.shared.clone(),
+            id: 0,
+            closed: None,
+        }
+    }
+
     /// Request stdin EOF; the writer task drops its write half and exits.
     pub(crate) fn close_stdin(&self) {
         let _ = self.out_tx.send(OutFrame::CloseStdin);
@@ -311,7 +425,8 @@ impl Peer {
     }
 
     /// Record the terminal error once, fail every pending request with it,
-    /// and push it to every subscriber. Idempotent: only the first error wins.
+    /// and push it to every subscriber and the incoming-request queue.
+    /// Idempotent: only the first error wins.
     pub(crate) fn fail_closed(&self, error: SdkError) {
         {
             let mut slot = self.shared.closed_err.lock().unwrap();
@@ -338,6 +453,10 @@ impl Peer {
         for tx in subscribers {
             let _ = tx.send(SubMsg::Closed(error.clone()));
         }
+        let _ = self
+            .shared
+            .requests
+            .send(IncomingMsg::Closed(error.clone()));
     }
 
     fn closed_error(&self) -> Option<SdkError> {
@@ -408,13 +527,11 @@ impl NotificationSubscription {
 
 impl Drop for NotificationSubscription {
     fn drop(&mut self) {
-        self.shared.subscribers.lock().unwrap().remove(&self.id);
+        // Slot 0 is the permanent unmatched-notification queue.
+        if self.id != 0 {
+            self.shared.subscribers.lock().unwrap().remove(&self.id);
+        }
     }
-}
-
-/// Serialize one compact JSON-RPC frame (no trailing newline).
-fn json_line(map: Map<String, Value>) -> String {
-    serde_json::to_string(&map).expect("json value serialization cannot fail")
 }
 
 /// The pending-map key for a frame id: strings verbatim, numbers as their

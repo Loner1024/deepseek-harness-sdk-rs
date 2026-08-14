@@ -28,6 +28,18 @@ pub struct Notification {
     pub payload: Value,
 }
 
+/// One server-to-client request, queued until the caller answers it with
+/// [`HarnessClient::respond`] or [`HarnessClient::respond_error`].
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct IncomingRequest {
+    /// Request id, preserved verbatim for the response frame.
+    pub id: Value,
+    /// JSON-RPC method name.
+    pub method: String,
+    /// Request params object; absent or non-object params read as `{}`.
+    pub payload: Value,
+}
+
 /// Parameters for the process-wide `initialize` handshake.
 #[derive(Debug, Clone)]
 pub struct InitializeParams {
@@ -51,7 +63,7 @@ pub struct InitializeResult {
 /// The `serverInfo` object of the initialize handshake.
 #[derive(Debug, Clone)]
 pub struct ServerInfo {
-    /// Server identity; the protocol value is `deepseek-harness-sdk-rs-runtime`.
+    /// Server identity; the protocol value is `deepseek-harness-sdk-runtime`.
     pub name: Option<String>,
     /// Server version.
     pub version: Option<String>,
@@ -122,6 +134,7 @@ struct ClientInner {
     state: Mutex<Option<ClientState>>,
     parents: Arc<std::sync::Mutex<HashMap<String, String>>>,
     stderr_tail: Arc<std::sync::Mutex<VecDeque<String>>>,
+    default_subscription: Mutex<Option<NotificationSubscription>>,
 }
 
 /// The protocol client; clone to share one runtime subprocess.
@@ -144,6 +157,7 @@ impl HarnessClient {
                 state: Mutex::new(None),
                 parents: Arc::new(std::sync::Mutex::new(HashMap::new())),
                 stderr_tail: Arc::new(std::sync::Mutex::new(VecDeque::new())),
+                default_subscription: Mutex::new(None),
             }),
         }
     }
@@ -188,6 +202,7 @@ impl HarnessClient {
             let _ = child.wait().await;
             return Ok(());
         }
+        *self.inner.default_subscription.lock().await = Some(peer.subscribe_default());
 
         let stderr_eof = Arc::new(tokio::sync::Notify::new());
         let stderr_tail = self.inner.stderr_tail.clone();
@@ -304,6 +319,46 @@ impl HarnessClient {
             SdkError::transport_closed("DeepSeek Harness runtime is not running", None, &[])
         })?;
         peer.notify(method, params)
+    }
+
+    /// Wait for the next notification that no subscriber matched.
+    pub async fn next_notification(&self) -> Result<Notification, SdkError> {
+        let mut guard = self.inner.default_subscription.lock().await;
+        let subscription = guard.as_mut().ok_or_else(|| {
+            SdkError::transport_closed("DeepSeek Harness runtime is not running", None, &[])
+        })?;
+        subscription.next().await
+    }
+
+    /// Wait for the next server-to-client request queued by the runtime.
+    pub async fn next_request(&self) -> Result<IncomingRequest, SdkError> {
+        let peer = self.inner.peer.get().ok_or_else(|| {
+            SdkError::transport_closed("DeepSeek Harness runtime is not running", None, &[])
+        })?;
+        peer.next_request().await
+    }
+
+    /// Answer a server-to-client request with a result frame.
+    pub async fn respond(&self, id: &Value, result: Value) -> Result<(), SdkError> {
+        let peer = self.inner.peer.get().ok_or_else(|| {
+            SdkError::transport_closed("DeepSeek Harness runtime is not running", None, &[])
+        })?;
+        peer.respond(id, result)
+    }
+
+    /// Answer a server-to-client request with an error frame; `data` rides
+    /// the error object when present.
+    pub async fn respond_error(
+        &self,
+        id: &Value,
+        code: i64,
+        message: &str,
+        data: Option<Value>,
+    ) -> Result<(), SdkError> {
+        let peer = self.inner.peer.get().ok_or_else(|| {
+            SdkError::transport_closed("DeepSeek Harness runtime is not running", None, &[])
+        })?;
+        peer.respond_error(id, code, message, data)
     }
 
     /// Subscribe to notifications; `filter` narrows delivery.

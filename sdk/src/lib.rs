@@ -38,8 +38,8 @@ pub use api::{
     Session,
 };
 pub use client::{
-    HarnessClient, HarnessClientOptions, InitializeParams, InitializeResult, Notification,
-    ServerInfo,
+    HarnessClient, HarnessClientOptions, IncomingRequest, InitializeParams, InitializeResult,
+    Notification, ServerInfo,
 };
 pub use error::SdkError;
 pub use transport::{NotificationFilter, NotificationSubscription};

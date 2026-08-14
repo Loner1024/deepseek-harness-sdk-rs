@@ -36,10 +36,7 @@ async fn initialize_handshake_reports_server_info() {
         .await
         .expect("initialize");
     let info = result.server_info.expect("serverInfo present");
-    assert_eq!(
-        info.name.as_deref(),
-        Some("deepseek-harness-sdk-rs-runtime")
-    );
+    assert_eq!(info.name.as_deref(), Some("deepseek-harness-sdk-runtime"));
     assert_eq!(info.version.as_deref(), Some("0.0.1"));
     client.close().await;
 }
@@ -240,15 +237,95 @@ async fn invalid_lines_are_ignored_and_valid_frames_delivered() {
 }
 
 #[tokio::test]
-async fn server_to_client_requests_answer_method_not_found() {
-    // The fake exits 0 only when the client answered its request with -32601,
-    // and initialize would fail if the fake died first.
+async fn server_requests_queue_for_the_caller() {
+    // The fake exits 0 only when the caller answers its request with the
+    // expected result frame.
     let client = HarnessClient::new(common::client_options("request-to-client"));
     client.start().await.expect("start");
     client
         .initialize(&initialize_params())
         .await
         .expect("initialize");
+    let request = client.next_request().await.expect("next_request");
+    assert_eq!(request.id, json!("req-1"));
+    assert_eq!(request.method, "approval/ask");
+    assert_eq!(request.payload, json!({}));
+    client
+        .respond(&request.id, json!({"ok": true}))
+        .await
+        .expect("respond");
+    client.close().await;
+}
+
+#[tokio::test]
+async fn respond_error_round_trips_code_and_data() {
+    let client = HarnessClient::new(common::client_options("request-to-client-error"));
+    client.start().await.expect("start");
+    client
+        .initialize(&initialize_params())
+        .await
+        .expect("initialize");
+    let request = client.next_request().await.expect("next_request");
+    assert_eq!(
+        request.id,
+        json!(42),
+        "the request id rides the response verbatim"
+    );
+    client
+        .respond_error(&request.id, 99, "no", Some(json!({"detail": "test"})))
+        .await
+        .expect("respond_error");
+    client.close().await;
+}
+
+#[tokio::test]
+async fn next_request_fails_after_the_runtime_closes() {
+    let client = HarnessClient::new(common::client_options("request-then-exit"));
+    client.start().await.expect("start");
+    client
+        .initialize(&initialize_params())
+        .await
+        .expect("initialize");
+    let request = client.next_request().await.expect("first request");
+    assert_eq!(request.method, "approval/ask");
+    let error = client.next_request().await.unwrap_err();
+    match error {
+        SdkError::TransportClosed { exit_code, .. } => assert_eq!(exit_code, Some(2)),
+        other => panic!("expected TransportClosed, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn next_notification_collects_unmatched_notifications() {
+    let client = HarnessClient::new(common::client_options("invalid-lines"));
+    client.start().await.expect("start");
+    client
+        .initialize(&initialize_params())
+        .await
+        .expect("initialize");
+    let notification = tokio::time::timeout(Duration::from_secs(5), client.next_notification())
+        .await
+        .expect("unmatched notification did not arrive")
+        .expect("next_notification failed");
+    assert_eq!(notification.method, "session.status");
+    client.close().await;
+}
+
+#[tokio::test]
+async fn next_notification_stays_empty_when_subscribers_match() {
+    let client = HarnessClient::new(common::client_options("invalid-lines"));
+    client.start().await.expect("start");
+    let mut subscription = client.subscribe(None).expect("subscribe");
+    client
+        .initialize(&initialize_params())
+        .await
+        .expect("initialize");
+    let notification = next_notification(&mut subscription).await;
+    assert_eq!(notification.method, "session.status");
+    // A matched notification must not also land on the unmatched queue.
+    let unmatched =
+        tokio::time::timeout(Duration::from_millis(300), client.next_notification()).await;
+    assert!(unmatched.is_err(), "the unmatched queue must stay empty");
     client.close().await;
 }
 

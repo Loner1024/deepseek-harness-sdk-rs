@@ -66,7 +66,7 @@ let harness = DeepSeekHarness::new(DeepSeekHarnessConfig {
 
 ## HarnessClient
 
-The low-level client: `start()`/`initialize()`/`session_prompt()`/`request()`/`notify()`/`close()`, plus `subscribe(filter)` and `subscribe_session_tree(id)` for notifications. `session_prompt()` resolves to the queued message id as soon as the runtime accepts the message, never waiting for agent activity. `close()` runs the shutdown ladder: protocol `shutdown` → stdin EOF → SIGTERM → SIGKILL with bounded waits, then fails pending requests and subscriptions.
+The low-level client: `start()`/`initialize()`/`session_prompt()`/`request()`/`notify()`/`close()`, plus `subscribe(filter)` and `subscribe_session_tree(id)` for notifications. `next_notification()` collects notifications no subscriber matched. Server-to-client requests queue for `next_request()` and are answered with `respond(id, result)` or `respond_error(id, code, message, data)` — the reserved approval-flow surface, mirroring the Python SDK. `session_prompt()` resolves to the queued message id as soon as the runtime accepts the message, never waiting for agent activity. `close()` runs the shutdown ladder: protocol `shutdown` → stdin EOF → SIGTERM → SIGKILL with bounded waits, then fails pending requests and subscriptions.
 
 ## Launch channels
 
@@ -91,5 +91,5 @@ The `test-support` feature builds the `dsh-fake-runtime` test binary that the me
 - **No protocol version negotiation** — the handshake reports `serverInfo.version` but clients do not verify it; pre-release, no compatibility promise.
 - **No cancel or session-close methods** — abandoning a turn means closing the runtime process; the protocol has no prompt-cancel method.
 - **No prompt-level result attribution** — `final_response` is the last assistant text of the collected interval.
-- **server→client requests answer `-32601`** — the transport has no request handler; approval flows are future protocol work on both ends.
+- **No server-to-client requests today** — the runtime never sends them; the client queues any that arrive for `respond`/`respond_error`, the reserved approval-flow surface.
 - **Downloader couples to the PyPI wheel stream** — the build workflow retains platform wheels and nothing else; a wheel with a different layout breaks resolution loudly.

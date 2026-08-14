@@ -12,7 +12,9 @@
 //! - `error` — answer `session/prompt` with a JSON-RPC error carrying data.
 //! - `crash` — write stderr lines and exit 7 right after `initialize`.
 //! - `no-shutdown` — never exit on `shutdown`; waits to be killed.
-//! - `request-to-client` — send a server-to-client request; expect `-32601`.
+//! - `request-to-client` — send a server-to-client request; expect a result frame `{"ok": true}`.
+//! - `request-to-client-error` — send a request; expect an error frame with code 99.
+//! - `request-then-exit` — send a request, then exit 2 without waiting.
 //! - `subagent` — emit subagent lifecycle around a child session, then idle.
 //! - `invalid-lines` — emit garbage lines, then one valid notification.
 //! - `bad-turn-end` — `turn/end` whose reason lacks a string `kind`.
@@ -66,9 +68,9 @@ async fn main() {
                 let server_info = if scenario == "env" {
                     let config =
                         std::env::var("DSH_CORDIS_CONFIG").unwrap_or_else(|_| "unset".to_string());
-                    json!({"serverInfo": {"name": "deepseek-harness-sdk-rs-runtime", "version": config}})
+                    json!({"serverInfo": {"name": "deepseek-harness-sdk-runtime", "version": config}})
                 } else {
-                    json!({"serverInfo": {"name": "deepseek-harness-sdk-rs-runtime", "version": "0.0.1"}})
+                    json!({"serverInfo": {"name": "deepseek-harness-sdk-runtime", "version": "0.0.1"}})
                 };
                 respond(&mut stdout, &id, server_info);
                 match scenario.as_str() {
@@ -82,7 +84,22 @@ async fn main() {
                             &mut stdout,
                             &json!({"jsonrpc": "2.0", "id": "req-1", "method": "approval/ask", "params": {}}),
                         );
-                        // The client must answer -32601; the next line read is the response.
+                        // The caller answers with a result frame.
+                        let mut response = String::new();
+                        if stdin.read_line(&mut response).is_ok() {
+                            let answer: Value =
+                                serde_json::from_str(&response).unwrap_or(Value::Null);
+                            let ok = answer.get("result") == Some(&json!({"ok": true}));
+                            std::process::exit(if ok { 0 } else { 3 });
+                        }
+                        std::process::exit(3);
+                    }
+                    "request-to-client-error" => {
+                        write_line(
+                            &mut stdout,
+                            &json!({"jsonrpc": "2.0", "id": 42, "method": "approval/ask", "params": {"n": 1}}),
+                        );
+                        // The caller answers with an error frame.
                         let mut response = String::new();
                         if stdin.read_line(&mut response).is_ok() {
                             let answer: Value =
@@ -91,10 +108,18 @@ async fn main() {
                                 .get("error")
                                 .and_then(|error| error.get("code"))
                                 .and_then(Value::as_i64)
-                                == Some(-32601);
+                                == Some(99);
                             std::process::exit(if ok { 0 } else { 3 });
                         }
                         std::process::exit(3);
+                    }
+                    "request-then-exit" => {
+                        write_line(
+                            &mut stdout,
+                            &json!({"jsonrpc": "2.0", "id": "req-2", "method": "approval/ask", "params": {}}),
+                        );
+                        eprintln!("fake runtime exiting after request");
+                        std::process::exit(2);
                     }
                     "invalid-lines" => {
                         // Garbage lines must be ignored; the valid notification after them must arrive.

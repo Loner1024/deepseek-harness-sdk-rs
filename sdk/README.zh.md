@@ -66,7 +66,7 @@ let harness = DeepSeekHarness::new(DeepSeekHarnessConfig {
 
 ## HarnessClient
 
-低层客户端：`start()`/`initialize()`/`session_prompt()`/`request()`/`notify()`/`close()`，加上 `subscribe(filter)` 与 `subscribe_session_tree(id)` 通知订阅。`session_prompt()` 在运行时接受消息后立即解析为入队消息 id，绝不等待 agent 活动。`close()` 执行关闭阶梯：协议 `shutdown` → stdin EOF → SIGTERM → SIGKILL，各带有限等待，然后让挂起请求与订阅失败。
+低层客户端：`start()`/`initialize()`/`session_prompt()`/`request()`/`notify()`/`close()`，加上 `subscribe(filter)` 与 `subscribe_session_tree(id)` 通知订阅。`next_notification()` 收集没有订阅者匹配的通知。server→client 请求排队等待 `next_request()`，并以 `respond(id, result)` 或 `respond_error(id, code, message, data)` 应答——为审批流预留的接口，镜像 Python SDK。`session_prompt()` 在运行时接受消息后立即解析为入队消息 id，绝不等待 agent 活动。`close()` 执行关闭阶梯：协议 `shutdown` → stdin EOF → SIGTERM → SIGKILL，各带有限等待，然后让挂起请求与订阅失败。
 
 ## 启动通道
 
@@ -91,5 +91,5 @@ cargo test --features test-support
 - **无协议版本协商**——握手报告 `serverInfo.version` 但客户端不校验；处于预发布阶段，无兼容承诺。
 - **无取消与会话关闭方法**——放弃轮次意味着关闭运行时进程；协议没有提示词取消方法。
 - **无提示词级结果归属**——`final_response` 是所收集区间的最后一条助手文本。
-- **server→client 请求应答 `-32601`**——传输层没有请求处理器；审批流是两端未来的协议工作。
+- **今天没有 server→client 请求**——运行时从不发送；客户端把任何到达的请求排队等待 `respond`/`respond_error`，即预留的审批流接口。
 - **下载器耦合 PyPI wheel 流**——构建工作流只保留平台 wheel；布局不同的 wheel 会让解析响亮失败。
