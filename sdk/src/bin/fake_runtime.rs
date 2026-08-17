@@ -8,8 +8,11 @@
 //! Scenarios:
 //! - `basic` — the happy path: receipt → assistant text → turn end → idle.
 //! - `echo` — respond to every request with its params.
-//! - `slow` — sleep `$DSH_FAKE_DELAY_SECONDS` (default 2) before responding.
+//! - `slow` — write a stderr marker, then sleep `$DSH_FAKE_DELAY_SECONDS`
+//!   (default 2) before answering `session/prompt` and other requests.
 //! - `error` — answer `session/prompt` with a JSON-RPC error carrying data.
+//! - `reject-prompt` — answer `session/prompt` with `{"accepted": false}`.
+//! - `cwd` — report wire cwd, process cwd, and `$DSH_CWD` via `serverInfo.version`.
 //! - `crash` — write stderr lines and exit 7 right after `initialize`.
 //! - `no-shutdown` — never exit on `shutdown`; waits to be killed.
 //! - `request-to-client` — send a server-to-client request; expect a result frame `{"ok": true}`.
@@ -17,6 +20,8 @@
 //! - `request-then-exit` — send a request, then exit 2 without waiting.
 //! - `subagent` — emit subagent lifecycle around a child session, then idle.
 //! - `invalid-lines` — emit garbage lines, then one valid notification.
+//! - `invalid-id-notification` — emit a notification frame carrying a null id.
+//! - `ticks` — answer every `emit-*` request with one `tick` notification.
 //! - `bad-turn-end` — `turn/end` whose reason lacks a string `kind`.
 //! - `no-assistant` — a settled turn with no assistant message.
 //!
@@ -51,26 +56,51 @@ async fn main() {
         let Some(object) = message.as_object() else {
             continue;
         };
-        let Some(id) = object.get("id").map(|id| match id {
+        let method = object.get("method").and_then(Value::as_str);
+        let id = object.get("id").map(|id| match id {
             Value::String(s) => s.clone(),
             Value::Number(n) => n.to_string(),
             _ => String::new(),
-        }) else {
-            continue;
-        };
-        let Some(method) = object.get("method").and_then(Value::as_str) else {
-            continue;
-        };
+        });
         let params = object.get("params");
+
+        // Id-less frames from the client are notifications; the `ticks`
+        // scenario answers `emit-*` notifications with a `tick` notification.
+        let Some(id) = id else {
+            if scenario == "ticks" && method.is_some_and(|method| method.starts_with("emit-")) {
+                notify(
+                    &mut stdout,
+                    "tick",
+                    &json!({"source": method.expect("checked above")}),
+                );
+            }
+            continue;
+        };
+        let Some(method) = method else {
+            continue;
+        };
 
         match method {
             "initialize" => {
-                let server_info = if scenario == "env" {
-                    let config =
-                        std::env::var("DSH_CORDIS_CONFIG").unwrap_or_else(|_| "unset".to_string());
-                    json!({"serverInfo": {"name": "deepseek-harness-sdk-runtime", "version": config}})
-                } else {
-                    json!({"serverInfo": {"name": "deepseek-harness-sdk-runtime", "version": "0.0.1"}})
+                let server_info = match scenario.as_str() {
+                    "env" => {
+                        let config = std::env::var("DSH_CORDIS_CONFIG")
+                            .unwrap_or_else(|_| "unset".to_string());
+                        json!({"serverInfo": {"name": "deepseek-harness-sdk-runtime", "version": config}})
+                    }
+                    "cwd" => {
+                        let report = json!({
+                            "wire": params.and_then(|p| p.get("cwd")).cloned(),
+                            "process": std::env::current_dir()
+                                .ok()
+                                .map(|path| Value::from(path.to_string_lossy().into_owned())),
+                            "env": std::env::var("DSH_CWD").ok(),
+                        });
+                        json!({"serverInfo": {"name": "deepseek-harness-sdk-runtime", "version": report.to_string()}})
+                    }
+                    _ => {
+                        json!({"serverInfo": {"name": "deepseek-harness-sdk-runtime", "version": "0.0.1"}})
+                    }
                 };
                 respond(&mut stdout, &id, server_info);
                 match scenario.as_str() {
@@ -132,6 +162,14 @@ async fn main() {
                             &json!({"sessionId": "s", "status": "idle"}),
                         );
                     }
+                    "invalid-id-notification" => {
+                        // A non-string/non-number id must not make this frame a
+                        // request; the client delivers it as a notification.
+                        write_line(
+                            &mut stdout,
+                            &json!({"jsonrpc": "2.0", "id": null, "method": "tick", "params": {"n": 1}}),
+                        );
+                    }
                     _ => {}
                 }
             }
@@ -144,12 +182,16 @@ async fn main() {
                 match scenario.as_str() {
                     "echo" => respond(&mut stdout, &id, params.cloned().unwrap_or(Value::Null)),
                     "slow" => {
+                        eprintln!("fake runtime slow response coming");
                         let seconds = std::env::var("DSH_FAKE_DELAY_SECONDS")
                             .ok()
                             .and_then(|v| v.parse::<f64>().ok())
                             .unwrap_or(2.0);
                         tokio::time::sleep(tokio::time::Duration::from_secs_f64(seconds)).await;
                         respond(&mut stdout, &id, json!({"messageId": "msg-slow"}));
+                    }
+                    "reject-prompt" => {
+                        respond(&mut stdout, &id, json!({"accepted": false}));
                     }
                     "error" => respond_error(
                         &mut stdout,
@@ -290,17 +332,25 @@ async fn main() {
                     return;
                 }
             }
-            _ => {
-                if scenario == "echo" {
+            _ => match scenario.as_str() {
+                "echo" => respond(&mut stdout, &id, params.cloned().unwrap_or(Value::Null)),
+                "slow" => {
+                    let seconds = std::env::var("DSH_FAKE_DELAY_SECONDS")
+                        .ok()
+                        .and_then(|v| v.parse::<f64>().ok())
+                        .unwrap_or(2.0);
+                    tokio::time::sleep(tokio::time::Duration::from_secs_f64(seconds)).await;
                     respond(&mut stdout, &id, params.cloned().unwrap_or(Value::Null));
-                } else {
-                    respond_error(
-                        &mut stdout,
-                        &id,
-                        json!({"code": -32601, "message": "unknown method"}),
-                    );
                 }
-            }
+                "ticks" if method.starts_with("emit-") => {
+                    notify(&mut stdout, "tick", &json!({"source": method}))
+                }
+                _ => respond_error(
+                    &mut stdout,
+                    &id,
+                    json!({"code": -32601, "message": "unknown method"}),
+                ),
+            },
         }
     }
 }

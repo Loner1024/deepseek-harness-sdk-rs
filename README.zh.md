@@ -12,7 +12,7 @@
 
 ## 行为
 
-SDK 惰性启动运行时，并在多次 `run()` 调用间持有它。未给任何显式启动通道时，默认开启的 `runtime-download` feature 从 PyPI 风格的索引拉取平台运行时 wheel、校验摘要并缓存可执行程序；显式指定 `runtime_bin` 或 `command`/`args` 的调用方可以关闭该 feature。[SDK 参考](sdk/README.md)覆盖生命周期、结果、通知、运行时选择、配置与错误。
+SDK 惰性启动运行时，并在多次 `run()` 调用间持有它。未给任何显式启动通道时，默认开启的 `runtime-download` feature 从 PyPI 风格的索引拉取平台运行时 wheel、校验摘要并缓存可执行程序；显式指定 `runtime_bin` 或 `command`/`args` 的调用方可以关闭该 feature。与 Python SDK 的低层对齐包括：逐次请求超时覆盖（`request_with_timeout`）、超时错误携带运行时 stderr 尾部诊断、`cwd`/`runtime_cwd` 符号链接消解处理，以及通知过滤器失败的隔离。[SDK 参考](sdk/README.md)覆盖生命周期、结果、通知、运行时选择、配置与错误。
 
 ## 示例
 

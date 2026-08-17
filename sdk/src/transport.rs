@@ -124,24 +124,28 @@ impl Peer {
                 let Some(object) = message.as_object() else {
                     continue;
                 };
-                let id = object.get("id");
+                let raw_id = object.get("id");
                 let method = object.get("method").and_then(Value::as_str);
-                match (id, method) {
-                    (Some(raw_id), Some(method)) => {
+                // Only string and number values count as ids, mirroring the
+                // Python SDK and `@deepseek-ai/dsh-sdk-protocol`: a frame with
+                // another id shape plus a method is still a notification.
+                let valid_id = matches!(raw_id, Some(Value::String(_) | Value::Number(_)));
+                match (valid_id, method) {
+                    (true, Some(method)) => {
                         let payload = object
                             .get("params")
                             .filter(|p| p.is_object())
                             .cloned()
                             .unwrap_or_else(|| Value::Object(Map::new()));
                         let request = IncomingRequest {
-                            id: raw_id.clone(),
+                            id: raw_id.expect("valid id checked above").clone(),
                             method: method.to_string(),
                             payload,
                         };
                         let _ = reader_shared.requests.send(IncomingMsg::Request(request));
                     }
-                    (Some(id), None) => {
-                        let id = id_key(id);
+                    (true, None) => {
+                        let id = id_key(raw_id.expect("valid id checked above"));
                         let Some(sender) = reader_pending.lock().await.remove(&id) else {
                             continue;
                         };
@@ -163,7 +167,7 @@ impl Peer {
                                 .send(Ok(object.get("result").cloned().unwrap_or(Value::Null)));
                         }
                     }
-                    (None, Some(method)) => {
+                    (false, Some(method)) => {
                         let payload = object
                             .get("params")
                             .filter(|p| p.is_object())
@@ -176,17 +180,45 @@ impl Peer {
                         if let Some(hook) = &intercept {
                             hook(&notification);
                         }
-                        let subscribers = reader_shared.subscribers.lock().unwrap();
+                        let mut subscribers = reader_shared.subscribers.lock().unwrap();
                         let mut delivered = false;
+                        let mut failed: Vec<(u64, mpsc::UnboundedSender<SubMsg>, String)> =
+                            Vec::new();
                         for (slot_id, slot) in subscribers.iter() {
                             if *slot_id == 0 {
                                 continue;
                             }
-                            let matches = slot.filter.as_ref().is_none_or(|f| f(&notification));
+                            let matches = match slot.filter.as_ref() {
+                                None => true,
+                                Some(filter) => {
+                                    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                                        || filter(&notification),
+                                    )) {
+                                        Ok(matches) => matches,
+                                        Err(payload) => {
+                                            failed.push((
+                                                *slot_id,
+                                                slot.tx.clone(),
+                                                panic_payload_message(payload.as_ref()),
+                                            ));
+                                            continue;
+                                        }
+                                    }
+                                }
+                            };
                             if matches {
                                 let _ = slot.tx.send(SubMsg::Notification(notification.clone()));
                                 delivered = true;
                             }
+                        }
+                        // A panicking filter is contained to its own
+                        // subscription, mirroring the Python SDK: the
+                        // subscriber is removed and receives only the failure.
+                        for (slot_id, tx, message) in failed {
+                            subscribers.remove(&slot_id);
+                            let _ = tx.send(SubMsg::Closed(SdkError::protocol(format!(
+                                "notification filter panicked: {message}"
+                            ))));
                         }
                         // Notifications no subscriber matched land on the
                         // unmatched queue, mirroring the Python SDK.
@@ -194,7 +226,7 @@ impl Peer {
                             let _ = slot.tx.send(SubMsg::Notification(notification));
                         }
                     }
-                    (None, None) => continue,
+                    (false, None) => continue,
                 }
             }
             reader_shared.eof.notify_waiters();
@@ -221,7 +253,9 @@ impl Peer {
             pending,
             out_tx,
             shared,
-            request_timeout,
+            // A negative configured deadline behaves like the Python SDK's
+            // elapsed deadline: the next wait times out immediately.
+            request_timeout: request_timeout.map(|timeout| timeout.max(Duration::ZERO)),
             request_rx: Arc::new(Mutex::new(Some(requests_rx))),
         }
     }
@@ -310,6 +344,8 @@ impl Peer {
         params: Option<Value>,
         timeout: Option<Duration>,
     ) -> Result<Value, SdkError> {
+        // Negative explicit deadlines time out immediately, as in Python.
+        let timeout = timeout.map(|timeout| timeout.max(Duration::ZERO));
         if let Some(err) = self.closed_error() {
             return Err(err);
         }
@@ -541,6 +577,18 @@ fn id_key(value: &Value) -> String {
         Value::String(s) => s.clone(),
         Value::Number(n) => n.to_string(),
         _ => String::new(),
+    }
+}
+
+/// Human-readable text of a caught filter panic, when the payload carries one.
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
+    let any: &dyn std::any::Any = payload;
+    if let Some(message) = any.downcast_ref::<&str>() {
+        message.to_string()
+    } else if let Some(message) = any.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "unknown panic payload".to_string()
     }
 }
 

@@ -63,10 +63,11 @@ let harness = DeepSeekHarness::new(DeepSeekHarnessConfig {
 - `start_session(Some(id))` opens a named session handle; `run` with no session id creates a fresh session. Reusing a harness and session id preserves the session-owned Bash state.
 - `events` carries the root-session event payloads verbatim; `notifications` adds descendant notifications discovered through `subagent.started` lineage edges.
 - The optional positive-integer `max_tokens` caps model output for SDK-created agents and their in-process descendants.
+- `cwd` and `runtime_cwd` are resolved to absolute, symlink-resolved paths before subprocess launch, environment injection, and the wire handshake, mirroring the Python SDK's `Path.resolve()` semantics.
 
 ## HarnessClient
 
-The low-level client: `start()`/`initialize()`/`session_prompt()`/`request()`/`notify()`/`close()`, plus `subscribe(filter)` and `subscribe_session_tree(id)` for notifications. `next_notification()` collects notifications no subscriber matched. Server-to-client requests queue for `next_request()` and are answered with `respond(id, result)` or `respond_error(id, code, message, data)` — the reserved approval-flow surface, mirroring the Python SDK. `session_prompt()` resolves to the queued message id as soon as the runtime accepts the message, never waiting for agent activity. `close()` runs the shutdown ladder: protocol `shutdown` → stdin EOF → SIGTERM → SIGKILL with bounded waits, then fails pending requests and subscriptions.
+The low-level client: `start()`/`initialize()`/`session_prompt()`/`request()`/`request_with_timeout()`/`notify()`/`close()`, plus `subscribe(filter)` and `subscribe_session_tree(id)` for notifications. `request_with_timeout(method, params, timeout_seconds)` gives one call the Python SDK's per-call `timeout_seconds` override: `Some(seconds)` replaces the configured `request_timeout_seconds` for that call, `None` keeps it. `next_notification()` collects notifications no subscriber matched. Server-to-client requests queue for `next_request()` and are answered with `respond(id, result)` or `respond_error(id, code, message, data)` — the reserved approval-flow surface, mirroring the Python SDK. `session_prompt()` resolves to the queued message id as soon as the runtime accepts the message, never waiting for agent activity. A panicking notification filter is contained to its own subscription and fails only that subscription's next read. `close()` runs the shutdown ladder: protocol `shutdown` → stdin EOF → SIGTERM → SIGKILL with bounded waits, then fails pending requests and subscriptions.
 
 ## Launch channels
 
@@ -74,7 +75,7 @@ Most explicit wins: `launch_args_override`, `command`+`args`, `runtime_bin`, `$D
 
 ## Errors
 
-`SdkError` reproduces the Python taxonomy: `JsonRpcResponse` (preserving `code` and `data`), `RequestTimeout`, `Protocol` (a documented-protocol violation), `TransportClosed` (exit code plus bounded stderr tail), `Io`, `RuntimeResolve` (downloader failures), and `NestedRuntime` (the sync facade inside an async context).
+`SdkError` reproduces the Python taxonomy: `JsonRpcResponse` (preserving `code` and `data`), `RequestTimeout` (carrying available runtime diagnostics in its message), `Protocol` (a documented-protocol violation), `TransportClosed` (exit code plus bounded stderr tail), `Io`, `RuntimeResolve` (downloader failures), and `NestedRuntime` (the sync facade inside an async context).
 
 ## Development
 

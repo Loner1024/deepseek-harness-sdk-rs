@@ -3,6 +3,7 @@
 
 mod common;
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use deepseek_harness_sdk_rs::{HarnessClient, InitializeParams, SdkError};
@@ -87,7 +88,148 @@ async fn request_timeout_fires_after_the_deadline() {
         .session_prompt("s1", &[json!({"type": "text", "text": "hi"})])
         .await
         .unwrap_err();
+    // Python reports available subprocess diagnostics with the timeout.
+    match error {
+        SdkError::RequestTimeout { message } => {
+            assert!(message.contains("timed out waiting for DeepSeek Harness runtime"));
+            assert!(
+                message.contains("fake runtime slow response coming"),
+                "timeout must carry the stderr tail: {message}"
+            );
+        }
+        other => panic!("expected RequestTimeout, got {other:?}"),
+    }
+    client.close().await;
+}
+
+#[tokio::test]
+async fn per_call_timeout_override_replaces_the_config_for_one_request() {
+    let mut options = common::client_options("slow");
+    options.request_timeout_seconds = Some(0.1);
+    options.env = Some(
+        [("DSH_FAKE_DELAY_SECONDS".to_string(), "0.3".to_string())]
+            .into_iter()
+            .collect(),
+    );
+    let client = HarnessClient::new(options);
+    client.start().await.expect("start");
+
+    // The per-call 0.5s deadline outlives the 0.3s delayed response even
+    // though the configured 0.1s deadline would not.
+    let result = client
+        .request_with_timeout("anything", Some(json!({"n": 1})), Some(0.5))
+        .await
+        .expect("per-call timeout must win");
+    assert_eq!(result, json!({"n": 1}));
+
+    // `None` keeps the configured deadline, which still fires.
+    let error = client
+        .request_with_timeout("anything", Some(json!({"n": 2})), None)
+        .await
+        .unwrap_err();
     assert!(matches!(error, SdkError::RequestTimeout { .. }));
+    client.close().await;
+}
+
+#[tokio::test]
+async fn negative_timeouts_clamp_to_immediate() {
+    let mut options = common::client_options("echo");
+    options.request_timeout_seconds = Some(-1.0);
+    let client = HarnessClient::new(options);
+    client
+        .start()
+        .await
+        .expect("a negative configured timeout must not panic");
+    let error = client.request("anything", None).await.unwrap_err();
+    assert!(matches!(error, SdkError::RequestTimeout { .. }));
+    client.close().await;
+}
+
+#[tokio::test]
+async fn panicking_filters_are_contained_to_their_subscription() {
+    let client = HarnessClient::new(common::client_options("ticks"));
+    client.start().await.expect("start");
+    client
+        .initialize(&initialize_params())
+        .await
+        .expect("initialize");
+
+    let mut broken = client
+        .subscribe(Some(Arc::new(|_notification| {
+            panic!("bad notification filter")
+        })))
+        .expect("broken subscription");
+    let mut healthy = client
+        .subscribe(Some(Arc::new(|notification| notification.method == "tick")))
+        .expect("healthy subscription");
+
+    client.notify("emit-first", None).await.expect("notify");
+    let tick = next_notification(&mut healthy).await;
+    assert_eq!(
+        tick.payload.get("source").and_then(|v| v.as_str()),
+        Some("emit-first")
+    );
+
+    // The failure is delivered only to the broken subscription and does not
+    // kill the reader or leak the notification to the unmatched queue.
+    let error = tokio::time::timeout(Duration::from_secs(5), broken.next())
+        .await
+        .expect("broken subscription did not settle")
+        .unwrap_err();
+    match error {
+        SdkError::Protocol { message } => {
+            assert!(
+                message.contains("bad notification filter"),
+                "message: {message}"
+            );
+        }
+        other => panic!("expected Protocol error, got {other:?}"),
+    }
+    let unmatched =
+        tokio::time::timeout(Duration::from_millis(300), client.next_notification()).await;
+    assert!(unmatched.is_err(), "the unmatched queue must stay empty");
+
+    // The reader stays healthy for later traffic.
+    client.notify("emit-second", None).await.expect("notify");
+    let tick = next_notification(&mut healthy).await;
+    assert_eq!(
+        tick.payload.get("source").and_then(|v| v.as_str()),
+        Some("emit-second")
+    );
+    client.close().await;
+}
+
+#[tokio::test]
+async fn frames_with_invalid_ids_are_notifications_not_requests() {
+    let client = HarnessClient::new(common::client_options("invalid-id-notification"));
+    client.start().await.expect("start");
+    client
+        .initialize(&initialize_params())
+        .await
+        .expect("initialize");
+
+    let notification = tokio::time::timeout(Duration::from_secs(5), client.next_notification())
+        .await
+        .expect("notification did not arrive")
+        .expect("next_notification failed");
+    assert_eq!(notification.method, "tick");
+    assert_eq!(notification.payload.get("n"), Some(&json!(1)));
+
+    // The invalid id must not have queued a server-to-client request.
+    let request = tokio::time::timeout(Duration::from_millis(300), client.next_request()).await;
+    assert!(request.is_err(), "no request may be queued");
+    client.close().await;
+}
+
+#[tokio::test]
+async fn session_prompt_rejects_a_missing_message_id() {
+    let client = HarnessClient::new(common::client_options("reject-prompt"));
+    client.start().await.expect("start");
+    let error = client
+        .session_prompt("s1", &[json!({"type": "text", "text": "hi"})])
+        .await
+        .unwrap_err();
+    assert!(matches!(error, SdkError::Protocol { .. }));
     client.close().await;
 }
 

@@ -12,7 +12,7 @@ Rust SDK for driving DeepSeek Harness. The SDK spawns the harness runtime as a s
 
 ## Behavior
 
-The SDK launches the runtime lazily and owns it across `run()` calls. With no explicit launch channel, the `runtime-download` feature (default) fetches the platform runtime wheel from a PyPI-style index, verifies its digest, and caches the executable; explicit `runtime_bin` or `command`/`args` callers can disable the feature. [SDK reference](sdk/README.md) covers lifecycle, results, notifications, runtime selection, configuration, and errors.
+The SDK launches the runtime lazily and owns it across `run()` calls. With no explicit launch channel, the `runtime-download` feature (default) fetches the platform runtime wheel from a PyPI-style index, verifies its digest, and caches the executable; explicit `runtime_bin` or `command`/`args` callers can disable the feature. Low-level parity with the Python SDK includes per-call request timeout overrides (`request_with_timeout`), timeout diagnostics from the runtime's stderr tail, symlink-resolved `cwd`/`runtime_cwd` handling, and notification-filter failure containment. [SDK reference](sdk/README.md) covers lifecycle, results, notifications, runtime selection, configuration, and errors.
 
 ## Examples
 

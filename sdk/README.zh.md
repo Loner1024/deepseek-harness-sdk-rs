@@ -63,10 +63,11 @@ let harness = DeepSeekHarness::new(DeepSeekHarnessConfig {
 - `start_session(Some(id))` 打开具名会话句柄；`run` 未给会话 id 时创建全新会话。复用同一 harness 与会话 id 保留会话所属的 Bash 状态。
 - `events` 原样携带根会话事件载荷；`notifications` 还包括经 `subagent.started` 血缘边发现的后代通知。
 - 可选正整数 `max_tokens` 限制 SDK 创建的 agent 及其进程内后代的模型输出。
+- `cwd` 与 `runtime_cwd` 会在子进程启动、环境注入与线上握手之前解析为绝对、符号链接已消解（symlink-resolved）的路径，镜像 Python SDK 的 `Path.resolve()` 语义。
 
 ## HarnessClient
 
-低层客户端：`start()`/`initialize()`/`session_prompt()`/`request()`/`notify()`/`close()`，加上 `subscribe(filter)` 与 `subscribe_session_tree(id)` 通知订阅。`next_notification()` 收集没有订阅者匹配的通知。server→client 请求排队等待 `next_request()`，并以 `respond(id, result)` 或 `respond_error(id, code, message, data)` 应答——为审批流预留的接口，镜像 Python SDK。`session_prompt()` 在运行时接受消息后立即解析为入队消息 id，绝不等待 agent 活动。`close()` 执行关闭阶梯：协议 `shutdown` → stdin EOF → SIGTERM → SIGKILL，各带有限等待，然后让挂起请求与订阅失败。
+低层客户端：`start()`/`initialize()`/`session_prompt()`/`request()`/`request_with_timeout()`/`notify()`/`close()`，加上 `subscribe(filter)` 与 `subscribe_session_tree(id)` 通知订阅。`request_with_timeout(method, params, timeout_seconds)` 为单次调用提供 Python SDK 的逐次 `timeout_seconds` 覆盖：`Some(seconds)` 在该次调用替换配置的 `request_timeout_seconds`，`None` 保持配置值。`next_notification()` 收集没有订阅者匹配的通知。server→client 请求排队等待 `next_request()`，并以 `respond(id, result)` 或 `respond_error(id, code, message, data)` 应答——为审批流预留的接口，镜像 Python SDK。`session_prompt()` 在运行时接受消息后立即解析为入队消息 id，绝不等待 agent 活动。发生 panic 的通知过滤器会被隔离在它自己的订阅内，只让该订阅的下一次读取失败。`close()` 执行关闭阶梯：协议 `shutdown` → stdin EOF → SIGTERM → SIGKILL，各带有限等待，然后让挂起请求与订阅失败。
 
 ## 启动通道
 
@@ -74,7 +75,7 @@ let harness = DeepSeekHarness::new(DeepSeekHarnessConfig {
 
 ## 错误
 
-`SdkError` 复现 Python 分类：`JsonRpcResponse`（保留 `code` 与 `data`）、`RequestTimeout`、`Protocol`（文档化协议违例）、`TransportClosed`（退出码加有界 stderr 尾部）、`Io`、`RuntimeResolve`（下载器失败）与 `NestedRuntime`（异步上下文内调用同步门面）。
+`SdkError` 复现 Python 分类：`JsonRpcResponse`（保留 `code` 与 `data`）、`RequestTimeout`（消息中携带可用的运行时诊断）、`Protocol`（文档化协议违例）、`TransportClosed`（退出码加有界 stderr 尾部）、`Io`、`RuntimeResolve`（下载器失败）与 `NestedRuntime`（异步上下文内调用同步门面）。
 
 ## 开发
 

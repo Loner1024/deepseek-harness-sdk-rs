@@ -180,7 +180,9 @@ impl HarnessClient {
             .stderr(Stdio::piped())
             .kill_on_drop(true);
         if let Some(cwd) = &self.inner.options.cwd {
-            command.current_dir(cwd);
+            // Python resolves the runtime cwd to an absolute, symlink-free
+            // path before launch; mirror that here.
+            command.current_dir(crate::resolve_path(cwd));
         }
         let mut child = command.spawn().map_err(SdkError::from)?;
         let stdin = child.stdin.take().expect("stdin piped");
@@ -194,7 +196,7 @@ impl HarnessClient {
             self.inner
                 .options
                 .request_timeout_seconds
-                .map(Duration::from_secs_f64),
+                .map(|seconds| Duration::from_secs_f64(seconds.max(0.0))),
         );
         if self.inner.peer.set(peer.clone()).is_err() {
             // A concurrent start() won the race; reap this duplicate child.
@@ -255,7 +257,7 @@ impl HarnessClient {
         &self,
         params: &InitializeParams,
     ) -> Result<InitializeResult, SdkError> {
-        let cwd = std::path::absolute(&params.cwd)?;
+        let cwd = crate::resolve_path(&params.cwd);
         let mut payload = Map::new();
         payload.insert(
             "cwd".to_string(),
@@ -305,12 +307,89 @@ impl HarnessClient {
             })
     }
 
-    /// Send one request frame and await its response.
+    /// Send one request frame and await its response, honoring the configured
+    /// `request_timeout_seconds`. A timeout carries the runtime diagnostics
+    /// (exit code and stderr tail when available), as in the Python SDK.
     pub async fn request(&self, method: &str, params: Option<Value>) -> Result<Value, SdkError> {
+        self.request_with_timeout(method, params, None).await
+    }
+
+    /// [`Self::request`] with a per-call deadline in seconds, the Python
+    /// SDK's `timeout_seconds` override: `Some(seconds)` replaces the
+    /// configured deadline for this call, `None` keeps it.
+    pub async fn request_with_timeout(
+        &self,
+        method: &str,
+        params: Option<Value>,
+        timeout_seconds: Option<f64>,
+    ) -> Result<Value, SdkError> {
         let peer = self.inner.peer.get().ok_or_else(|| {
             SdkError::transport_closed("DeepSeek Harness runtime is not running", None, &[])
         })?;
-        peer.request(method, params).await
+        let result = match timeout_seconds {
+            None => peer.request(method, params).await,
+            Some(seconds) => {
+                peer.request_with_timeout(
+                    method,
+                    params,
+                    Some(Duration::from_secs_f64(seconds.max(0.0))),
+                )
+                .await
+            }
+        };
+        match result {
+            Err(SdkError::RequestTimeout { .. }) => {
+                let diagnostics = self.runtime_diagnostics().await;
+                let suffix = if diagnostics.is_empty() {
+                    String::new()
+                } else {
+                    format!("\n{diagnostics}")
+                };
+                Err(SdkError::RequestTimeout {
+                    message: format!(
+                        "{method} timed out waiting for DeepSeek Harness runtime{suffix}"
+                    ),
+                })
+            }
+            other => other,
+        }
+    }
+
+    /// Subprocess state available for timeout and transport-failure reports:
+    /// the exit code when already observed and the bounded stderr tail.
+    async fn runtime_diagnostics(&self) -> String {
+        let mut parts = Vec::new();
+        if let Some(state) = self.inner.state.lock().await.as_ref() {
+            let exited = {
+                let mut child = state.child.lock().await;
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        if let Some(code) = status.code() {
+                            parts.push(format!("exit code: {code}"));
+                        }
+                        true
+                    }
+                    _ => false,
+                }
+            };
+            if exited {
+                // Give the stderr reader a bounded moment to drain the last
+                // lines, mirroring the Python SDK's 0.1s join.
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+        let tail: Vec<String> = self
+            .inner
+            .stderr_tail
+            .lock()
+            .unwrap()
+            .iter()
+            .cloned()
+            .collect();
+        if !tail.is_empty() {
+            parts.push(format!("stderr tail:\n{}", tail.join("\n")));
+        }
+        parts.join("\n")
     }
 
     /// Send one notification frame to the runtime.

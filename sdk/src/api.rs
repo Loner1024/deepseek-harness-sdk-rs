@@ -26,10 +26,11 @@ pub struct DeepSeekHarnessConfig {
     pub model: String,
     /// Optional positive output-token cap inherited by SDK-created agents.
     pub max_tokens: Option<u64>,
-    /// Workspace directory recorded on every SDK-created session; default the
-    /// process working directory.
+    /// Workspace directory recorded on every SDK-created session; resolved to
+    /// an absolute, symlink-free path. Default the process working directory.
     pub cwd: Option<PathBuf>,
-    /// Working directory of the spawned runtime; default the workspace `cwd`.
+    /// Working directory of the spawned runtime; resolved the same way.
+    /// Default the workspace `cwd`.
     pub runtime_cwd: Option<PathBuf>,
     /// Persistent session root; sets `DSH_SESSION_ROOT` when given.
     pub session_root: Option<PathBuf>,
@@ -164,12 +165,23 @@ pub struct DeepSeekHarness {
 impl DeepSeekHarness {
     /// Build a harness for the given configuration.
     pub fn new(config: DeepSeekHarnessConfig) -> Self {
+        // Python's `Path.resolve()` semantics: absolute and symlink-resolved,
+        // with any not-yet-existing tail preserved. Applied before environment
+        // injection and the wire handshake, and again at subprocess launch.
         let cwd = config
             .cwd
-            .clone()
-            .map(|path| std::path::absolute(&path).unwrap_or(path))
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-        let runtime_cwd = config.runtime_cwd.clone().unwrap_or_else(|| cwd.clone());
+            .as_deref()
+            .map(crate::resolve_path)
+            .unwrap_or_else(|| {
+                std::env::current_dir()
+                    .map(|path| crate::resolve_path(&path))
+                    .unwrap_or_else(|_| PathBuf::from("."))
+            });
+        let runtime_cwd = config
+            .runtime_cwd
+            .as_deref()
+            .map(crate::resolve_path)
+            .unwrap_or_else(|| cwd.clone());
         let mut env = config.env.clone();
         if let Some(root) = &config.session_root {
             env.insert(

@@ -7,7 +7,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use deepseek_harness_sdk_rs::{
-    DeepSeekHarness, DeepSeekHarnessConfig, DeepSeekHarnessSync, RunOptions, SdkError,
+    DeepSeekHarness, DeepSeekHarnessConfig, DeepSeekHarnessSync, InitializeParams, RunOptions,
+    SdkError,
 };
 use serde_json::json;
 
@@ -125,6 +126,66 @@ async fn explicit_content_blocks_pass_through() {
         .await
         .expect("run");
     assert_eq!(result.final_response, "hello from fake");
+    harness.close().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cwd_and_runtime_cwd_resolve_before_launch_and_handshake() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    let workspace = temp.path().join("workspace");
+    let runtime_dir = temp.path().join("runtime-dir");
+    std::fs::create_dir_all(&workspace).expect("workspace dir");
+    std::fs::create_dir_all(&runtime_dir).expect("runtime dir");
+    let workspace_link = temp.path().join("workspace-link");
+    let runtime_link = temp.path().join("runtime-link");
+    symlink(&workspace, &workspace_link).expect("workspace symlink");
+    symlink(&runtime_dir, &runtime_link).expect("runtime symlink");
+
+    let harness = DeepSeekHarness::new(DeepSeekHarnessConfig {
+        launch_args_override: Some(vec![common::fake_runtime(), "cwd".to_string()]),
+        cwd: Some(workspace_link.clone()),
+        runtime_cwd: Some(runtime_link.clone()),
+        ..Default::default()
+    });
+    harness.start().await.expect("start resolves both paths");
+
+    // The fake `cwd` scenario reports the wire cwd, the subprocess cwd, and
+    // `$DSH_CWD`; all three must be the symlink-resolved targets, matching
+    // Python's `Path.resolve()` semantics.
+    let report = harness
+        .client()
+        .initialize(&InitializeParams {
+            cwd: workspace_link,
+            provider: "p".to_string(),
+            model: "m".to_string(),
+            max_tokens: None,
+        })
+        .await
+        .expect("second initialize");
+    let version = report
+        .server_info
+        .expect("serverInfo")
+        .version
+        .expect("version");
+    let report: serde_json::Value = serde_json::from_str(&version).expect("cwd report is JSON");
+
+    let workspace = std::fs::canonicalize(&workspace).expect("canonical workspace");
+    let runtime_dir = std::fs::canonicalize(&runtime_dir).expect("canonical runtime dir");
+    assert_eq!(
+        report.get("wire").and_then(|value| value.as_str()),
+        workspace.to_str()
+    );
+    assert_eq!(
+        report.get("process").and_then(|value| value.as_str()),
+        runtime_dir.to_str()
+    );
+    assert_eq!(
+        report.get("env").and_then(|value| value.as_str()),
+        workspace.to_str()
+    );
     harness.close().await;
 }
 
