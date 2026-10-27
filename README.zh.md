@@ -2,6 +2,10 @@
 
 [English](README.md) | 中文
 
+[![测试](https://github.com/Loner1024/deepseek-harness-sdk-rs/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Loner1024/deepseek-harness-sdk-rs/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/deepseek-harness-sdk-rs.svg)](https://crates.io/crates/deepseek-harness-sdk-rs)
+[![docs.rs](https://docs.rs/deepseek-harness-sdk-rs/badge.svg)](https://docs.rs/deepseek-harness-sdk-rs)
+
 驱动 DeepSeek Harness 的 Rust SDK。SDK 把打包的 `dsh` CLI（`--profile sdk`）作为子进程启动，通过其 stdio 上的按行分帧 JSON-RPC 2.0 协议通信。CLI 及其 sidecar 随 `deepseek-harness-runtime-bin` wheel 分发，Python SDK 使用同一个 wheel；Rust 客户端是协议的 clean-room 重实现，镜像 Python SDK 的分层。
 
 ## 包

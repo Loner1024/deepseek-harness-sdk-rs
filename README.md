@@ -2,6 +2,10 @@
 
 English | [中文](README.zh.md)
 
+[![Tests](https://github.com/Loner1024/deepseek-harness-sdk-rs/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Loner1024/deepseek-harness-sdk-rs/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/deepseek-harness-sdk-rs.svg)](https://crates.io/crates/deepseek-harness-sdk-rs)
+[![docs.rs](https://docs.rs/deepseek-harness-sdk-rs/badge.svg)](https://docs.rs/deepseek-harness-sdk-rs)
+
 Rust SDK for driving DeepSeek Harness. The SDK spawns the packaged `dsh` CLI (`--profile sdk`) as a subprocess and speaks the line-delimited JSON-RPC 2.0 protocol over its stdio. The CLI and its sidecars are distributed in the `deepseek-harness-runtime-bin` wheel also used by the [Python SDK](https://github.com/deepseek-ai/deepseek-harness/blob/master/python/README.md); the Rust client is a clean-room reimplementation of the protocol, mirroring the Python SDK's layering.
 
 ## Packages

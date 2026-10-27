@@ -2,6 +2,10 @@
 
 [English](README.md) | 中文
 
+[![测试](https://github.com/Loner1024/deepseek-harness-sdk-rs/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Loner1024/deepseek-harness-sdk-rs/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/deepseek-harness-sdk-rs.svg)](https://crates.io/crates/deepseek-harness-sdk-rs)
+[![docs.rs](https://docs.rs/deepseek-harness-sdk-rs/badge.svg)](https://docs.rs/deepseek-harness-sdk-rs)
+
 DeepSeek Harness 的 Rust SDK。SDK 把打包的 `dsh` CLI（`--profile sdk`）作为子进程启动，并在其 stdio 上以按行分帧 JSON-RPC 2.0 协议驱动它（[协议参考](https://github.com/deepseek-ai/deepseek-harness/blob/master/packages/sdk/protocol/README.md)）。CLI 及其 sidecar 随 `deepseek-harness-runtime-bin` wheel 分发，Python SDK 使用同一个 wheel。分层镜像 Python SDK：[`DeepSeekHarness`](#deepseekharness) 是高层自有运行 API，[`HarnessClient`](#harnessclient) 是低层协议客户端，`SdkError` 复现 Python 错误分类。
 
 ## 平台
