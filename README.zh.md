@@ -8,6 +8,44 @@
 
 驱动 DeepSeek Harness 的 Rust SDK。SDK 把打包的 `dsh` CLI（`--profile sdk`）作为子进程启动，通过其 stdio 上的按行分帧 JSON-RPC 2.0 协议通信。CLI 及其 sidecar 随 `deepseek-harness-runtime-bin` wheel 分发，Python SDK 使用同一个 wheel；Rust 客户端是协议的 clean-room 重实现，镜像 Python SDK 的分层。
 
+## 安装
+
+```sh
+cargo add deepseek-harness-sdk-rs@0.2.1-rc.2
+```
+
+默认开启的 `runtime-download` feature 会在首次运行时从 PyPI 拉取平台 `dsh` 运行时 wheel 并缓存，不需要系统 Node.js。本仓库固定 Rust 1.97.1。
+
+## 快速开始
+
+```toml
+[dependencies]
+deepseek-harness-sdk-rs = "0.2.1-rc.2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+```
+
+设置 provider key 与隔离的 Harness home：
+
+```sh
+export DEEPSEEK_API_KEY=sk-your-key-here
+export DSH_HOME=/absolute/path/to/isolated-dsh-home
+```
+
+```rust,no_run
+use deepseek_harness_sdk_rs::{DeepSeekHarness, DeepSeekHarnessConfig, RunOptions};
+
+#[tokio::main]
+async fn main() -> Result<(), deepseek_harness_sdk_rs::SdkError> {
+    let harness = DeepSeekHarness::new(DeepSeekHarnessConfig::default());
+    let result = harness.run("Say hi.", &RunOptions::default()).await?;
+    println!("{}", result.final_response);
+    harness.close().await;
+    Ok(())
+}
+```
+
+托管启动必须提供 `DSH_HOME` 或 `dsh_home`；SDK 绝不自动发现 `~/.dsh`。复用同一 home 与会话 id 可继续对话。会话、通知、子代理与自定义 profile 见 [SDK 参考](sdk/README.zh.md)。
+
 ## 包
 
 | 目录 | Crate | 职责 |

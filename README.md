@@ -8,6 +8,44 @@ English | [中文](README.zh.md)
 
 Rust SDK for driving DeepSeek Harness. The SDK spawns the packaged `dsh` CLI (`--profile sdk`) as a subprocess and speaks the line-delimited JSON-RPC 2.0 protocol over its stdio. The CLI and its sidecars are distributed in the `deepseek-harness-runtime-bin` wheel also used by the [Python SDK](https://github.com/deepseek-ai/deepseek-harness/blob/master/python/README.md); the Rust client is a clean-room reimplementation of the protocol, mirroring the Python SDK's layering.
 
+## Installation
+
+```sh
+cargo add deepseek-harness-sdk-rs@0.2.1-rc.2
+```
+
+The default `runtime-download` feature fetches the platform `dsh` runtime wheel from PyPI on first use and caches it; no system Node.js is required. The repository pins Rust 1.97.1.
+
+## Quick start
+
+```toml
+[dependencies]
+deepseek-harness-sdk-rs = "0.2.1-rc.2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+```
+
+Set the provider key and an isolated Harness home:
+
+```sh
+export DEEPSEEK_API_KEY=sk-your-key-here
+export DSH_HOME=/absolute/path/to/isolated-dsh-home
+```
+
+```rust,no_run
+use deepseek_harness_sdk_rs::{DeepSeekHarness, DeepSeekHarnessConfig, RunOptions};
+
+#[tokio::main]
+async fn main() -> Result<(), deepseek_harness_sdk_rs::SdkError> {
+    let harness = DeepSeekHarness::new(DeepSeekHarnessConfig::default());
+    let result = harness.run("Say hi.", &RunOptions::default()).await?;
+    println!("{}", result.final_response);
+    harness.close().await;
+    Ok(())
+}
+```
+
+Every managed launch requires `DSH_HOME` or `dsh_home`; the SDK never discovers `~/.dsh`. Reuse the same home and session id to continue a conversation. See the [SDK reference](sdk/README.md) for sessions, notifications, subagents, and custom profiles.
+
 ## Packages
 
 | Directory | Crate | Responsibility |

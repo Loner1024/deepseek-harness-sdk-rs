@@ -18,7 +18,28 @@ macOS (arm64, x64), Linux (x64, arm64), and Windows (x64), matching the runtime 
 
 The crate version tracks the runtime wheel release it targets, spelled as PEP 440 (`0.2.1-rc.2` → `0.2.1rc2`). `$DSH_RUNTIME_VERSION` targets a different release.
 
+## Installation
+
+```sh
+cargo add deepseek-harness-sdk-rs@0.2.1-rc.2
+```
+
+The default `runtime-download` feature fetches the platform `dsh` runtime wheel from PyPI on first use and caches the executable and its sidecars; no system Node.js is required. The repository pins Rust 1.97.1.
+
 ## Usage
+
+```toml
+[dependencies]
+deepseek-harness-sdk-rs = "0.2.1-rc.2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+```
+
+Set `DEEPSEEK_API_KEY`. Pass an isolated Harness home as `dsh_home` in code, or provide a non-empty `DSH_HOME` in the environment; the example below uses the field.
+
+```sh
+export DEEPSEEK_API_KEY=sk-your-key-here
+# Alternatively: export DSH_HOME=/absolute/path/to/isolated-dsh-home
+```
 
 ```rust,no_run
 use std::path::PathBuf;

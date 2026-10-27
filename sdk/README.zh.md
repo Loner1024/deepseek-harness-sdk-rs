@@ -18,7 +18,28 @@ macOS（arm64、x64）、Linux（x64、arm64）与 Windows（x64），与运行�
 
 crate 版本与其目标的运行时 wheel 发布对齐，并以 PEP 440 拼写（`0.2.1-rc.2` → `0.2.1rc2`）；`$DSH_RUNTIME_VERSION` 指向其他发布。
 
+## 安装
+
+```sh
+cargo add deepseek-harness-sdk-rs@0.2.1-rc.2
+```
+
+默认开启的 `runtime-download` feature 会在首次运行时从 PyPI 拉取平台 `dsh` 运行时 wheel，并缓存可执行程序及其 sidecar；不需要系统 Node.js。本仓库固定 Rust 1.97.1。
+
 ## 用法
+
+```toml
+[dependencies]
+deepseek-harness-sdk-rs = "0.2.1-rc.2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+```
+
+设置 `DEEPSEEK_API_KEY`。Harness home 可通过代码中的 `dsh_home` 传入，或通过环境中的非空 `DSH_HOME` 提供；下面的示例使用字段。
+
+```sh
+export DEEPSEEK_API_KEY=sk-your-key-here
+# 或者：export DSH_HOME=/absolute/path/to/isolated-dsh-home
+```
 
 ```rust,no_run
 use std::path::PathBuf;
