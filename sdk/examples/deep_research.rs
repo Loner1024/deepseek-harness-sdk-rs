@@ -1,20 +1,21 @@
 //! Deep research example: one research topic, delegated subtopics.
 //!
-//! The runtime composition ([`deep_research.cordis.yml`](deep_research.cordis.yml))
-//! mounts `web_search`, `web_fetch`, and the in-process subagent tool. The
-//! main agent plans the research and delegates subtopics to subagents; this
-//! program renders the live notification stream (subagent lifecycle, session
-//! status, subagent reports) and prints the synthesized final report.
+//! The default `sdk` profile mounts `web_search`, `web_fetch`, and the
+//! in-process subagent tool. The main agent plans the research and delegates
+//! subtopics to subagents; this program renders the live notification stream
+//! (subagent lifecycle, session status, subagent reports) and prints the
+//! synthesized final report.
 //!
 //! ```sh
 //! export DEEPSEEK_API_KEY=sk-your-key-here
+//! # export DSH_HOME=/absolute/path/to/isolated-dsh-home
 //! cargo run --package deepseek-harness-sdk-rs --example deep_research -- \
 //!   "self-hosted vector databases"
 //! ```
 //!
 //! Optional flags: `--session <id>` (reuse a session), `--runtime-bin <path>`
 //! (explicit runtime executable; the downloader resolves it otherwise).
-//! `DSH_SYSTEM_PROMPT` overrides the research persona.
+//! `$DSH_HOME` selects the Harness home; otherwise a temporary home is used.
 
 use std::path::PathBuf;
 
@@ -23,47 +24,33 @@ use deepseek_harness_sdk_rs::{
 };
 use serde_json::Value;
 
-/// The research persona injected through `$DSH_SYSTEM_PROMPT` unless the
-/// caller already set one.
-const DEFAULT_PERSONA: &str = "You are a thorough research agent. Break every topic into focused \
-     subtopics, delegate each to a subagent, and synthesize a final report with sources. Prefer \
-     web_search and web_fetch for facts and cite URLs.";
-
 #[tokio::main]
 async fn main() {
     let (topic, session_id, runtime_bin) = parse_args();
 
-    let cordis = PathBuf::from(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/examples/deep_research.cordis.yml"
-    ));
-    let session_root =
-        std::env::temp_dir().join(format!("deep-research-{}", uuid::Uuid::new_v4().simple()));
-    if let Err(error) = std::fs::create_dir_all(&session_root) {
+    let dsh_home = std::env::var_os("DSH_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::temp_dir().join(format!("deep-research-{}", uuid::Uuid::new_v4().simple()))
+        });
+    if let Err(error) = std::fs::create_dir_all(&dsh_home) {
         eprintln!(
-            "error: cannot create session root {}: {error}",
-            session_root.display()
+            "error: cannot create Harness home {}: {error}",
+            dsh_home.display()
         );
         std::process::exit(1);
-    }
-
-    let mut env = std::collections::HashMap::new();
-    if std::env::var("DSH_SYSTEM_PROMPT").is_err() {
-        env.insert("DSH_SYSTEM_PROMPT".to_string(), DEFAULT_PERSONA.to_string());
     }
 
     let harness = DeepSeekHarness::new(DeepSeekHarnessConfig {
         model: "deepseek-v4-flash".to_string(),
         max_tokens: Some(16_384),
-        cordis: Some(cordis),
-        session_root: Some(session_root.clone()),
+        dsh_home: Some(dsh_home.clone()),
         runtime_bin,
-        env,
         ..Default::default()
     });
 
     eprintln!("research topic: {topic}");
-    eprintln!("session root:  {}", session_root.display());
+    eprintln!("harness home:  {}", dsh_home.display());
     eprintln!(
         "session id:    {}",
         session_id.as_deref().unwrap_or("<fresh>")

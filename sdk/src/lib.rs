@@ -1,16 +1,21 @@
 //! # deepseek-harness-sdk-rs
 //!
-//! Drive a DeepSeek Harness runtime from Rust. The SDK spawns the runtime as
-//! a subprocess and speaks the line-delimited JSON-RPC 2.0 protocol over its
-//! stdio ([protocol reference](https://github.com/deepseek-ai/deepseek-harness/blob/master/packages/sdk/protocol/README.md));
-//! the runtime is the single-file executable also distributed with the
-//! [Python SDK](../../../python/README.md).
+//! Drive a DeepSeek Harness runtime from Rust. The SDK spawns the packaged
+//! `dsh` CLI (`--profile sdk`) as a subprocess and speaks the line-delimited
+//! JSON-RPC 2.0 protocol over its stdio
+//! ([protocol reference](https://github.com/deepseek-ai/deepseek-harness/blob/master/packages/sdk/protocol/README.md));
+//! the CLI is distributed in the `deepseek-harness-runtime-bin` wheel also
+//! used by the [Python SDK](../../../python/README.md).
 //!
 //! ```no_run
+//! use std::path::PathBuf;
 //! use deepseek_harness_sdk_rs::{DeepSeekHarness, DeepSeekHarnessConfig, RunOptions};
 //!
 //! # async fn example() -> Result<(), deepseek_harness_sdk_rs::SdkError> {
-//! let harness = DeepSeekHarness::new(DeepSeekHarnessConfig::default());
+//! let harness = DeepSeekHarness::new(DeepSeekHarnessConfig {
+//!     dsh_home: Some(PathBuf::from("/absolute/path/to/isolated-dsh-home")),
+//!     ..Default::default()
+//! });
 //! let result = harness.run("say hi", &RunOptions::default()).await?;
 //! println!("{}", result.final_response);
 //! harness.close().await;
@@ -18,12 +23,14 @@
 //! # }
 //! ```
 //!
-//! Without any launch configuration the `runtime-download` feature (on by
-//! default) fetches the platform runtime wheel from PyPI, verifies its
-//! SHA-256 digest, and caches the executable. Callers who spawn their own
-//! runtime pass `runtime_bin` or `launch_args_override` and can disable the
-//! feature. A blocking facade ([`DeepSeekHarnessSync`]) covers synchronous
-//! callers.
+//! The runtime launches as the packaged `dsh` CLI with `--profile sdk`.
+//! Managed launches require an explicit Harness home (`dsh_home` or a
+//! non-empty `DSH_HOME`); the SDK never discovers `~/.dsh`. Without any launch configuration the
+//! `runtime-download` feature (on by default) fetches the platform runtime
+//! wheel from PyPI, verifies its SHA-256 digest, and caches the executable
+//! and its sidecars. Callers who spawn their own runtime pass `runtime_bin`
+//! or `launch_args_override` and can disable the feature. A blocking facade
+//! ([`DeepSeekHarnessSync`]) covers synchronous callers.
 
 pub mod api;
 pub mod client;
@@ -38,8 +45,8 @@ use std::path::{Component, Path, PathBuf};
 /// Resolve a path the way Python's `Path.resolve(strict=False)` does: make it
 /// absolute, collapse `.` and `..` lexically, resolve symlinks along the
 /// existing prefix, and keep any not-yet-existing tail verbatim. The SDK
-/// applies this to `cwd` and `runtime_cwd` before subprocess launch,
-/// environment injection, and the wire handshake.
+/// applies this to `cwd`/`runtime_cwd`, managed `dsh_home` and patch paths,
+/// explicit runtime binaries, and the wire handshake.
 pub(crate) fn resolve_path(path: &Path) -> PathBuf {
     if path.as_os_str().is_empty() {
         return std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -97,8 +104,10 @@ pub use api::{
     Session,
 };
 pub use client::{
-    HarnessClient, HarnessClientOptions, IncomingRequest, InitializeParams, InitializeResult,
-    Notification, ServerInfo,
+    ApprovalOutcome, ApprovalRequestParams, ApprovalRequestResult, HarnessClient,
+    HarnessClientOptions, IncomingRequest, InitializeParams, InitializeResult, Notification,
+    ServerInfo, UserQuestionAnswer, UserQuestionAnswerItem, UserQuestionCancellation,
+    UserQuestionHandler, UserQuestionRequest,
 };
 pub use error::SdkError;
 pub use transport::{NotificationFilter, NotificationSubscription};

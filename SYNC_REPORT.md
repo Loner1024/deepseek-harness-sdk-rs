@@ -1,68 +1,105 @@
 # Upstream sync report: deepseek-harness-sdk-rs ↔ deepseek-harness
 
-Baseline: official `deepseek-ai/deepseek-harness` master `47f943859b` (pulled, already
-up to date) vs. this repository `main`. The comparison reads the official Python SDK
-(`python/sdk/src/deepseek_harness/{api,client,errors,models,__init__}.py`), the shared
-wire protocol (`packages/sdk/protocol/README.md`, `src/types.ts`, `src/transport.ts`),
-and the two SDK agent notes. Official `git log --oneline -20` shows only release /
-publication / naming commits touching `python/sdk` or `packages/sdk` after the last
-sync; no new wire methods, notification payloads, or client semantics landed.
+Baseline: official `deepseek-ai/deepseek-harness` master `22ddee3792` (2026-10-23),
+whose Python SDK and wire protocol describe the `0.2.1-rc.3` development line.
+The latest published runtime wheel is `deepseek-harness-runtime-bin 0.2.1rc2`
+(2026-10-17), so this repository pins `0.2.1-rc.2`. The rc.3 additions
+(approvals and native user questions) are additive initialize fields; the rc2
+runtime accepts them, and the mechanism tier covers them with the fake runtime.
+
+The comparison reads the official Python SDK
+(`python/sdk/src/deepseek_harness/{api,client,models,errors,office,__init__}.py`),
+the shared wire protocol (`packages/sdk/protocol/README.md`, `src/types.ts`),
+the TypeScript client (`packages/sdk/client/src/{types,launch}.ts`), and the
+runtime wheel reference (`python/sdk-runtime/README.md`).
 
 ## Difference inventory
 
 | 项 | 官方行为 | rs 现状（盘点前） | 分类 | 动作 |
 |---|---|---|---|---|
-| 低层 `request()`/`session_prompt()` 等待响应期间的 drain 参数（`on_notification`/`notification_filter`/`notification_subscription`） | Python 在 0.05s 轮询切片里 drain 订阅，调用方可旁听一次请求期间的匹配通知 | 低层没有这三个参数；高层 `run()` 自己循环 `subscription.next()` 并调用 `on_notification`，区间语义一致 | 有意保留 | 不复刻。异步 Rust 中由调用方显式驱动订阅更清晰；高层 `run()` 行为已与 Python 对齐（此前结论复核成立） |
-| `request()` 逐次 `timeout_seconds` 覆盖 | Python `request(..., timeout_seconds=X)` 覆盖配置级 deadline，`None` 保持配置 | 只有配置级 `request_timeout_seconds` | 需同步 | 新增 `HarnessClient::request_with_timeout(method, params, timeout_seconds)`；`request()` 委托 `None`。测试：0.1s 配置下 0.5s 单次覆盖成功、`None` 仍按配置超时 |
-| 超时错误携带运行时诊断 | Python（`4445de9921`）把 exit code + stderr tail 附加进 `TimeoutError` | `SdkError::RequestTimeout` 消息只有裸文本 | 需同步 | 客户端在超时路径上补充退出码与 400 行 stderr tail（退出时等 0.1s 排空），格式同 Python。测试断言 stderr 标记出现在超时消息中 |
-| `cwd`/`runtime_cwd` 路径解析 | Python `Path.resolve()`：绝对化 + 词法折叠 `.`/`..` + 解析符号链接，再用于子进程 cwd、`DSH_CWD` 与 wire `initialize.cwd` | 只做 `std::path::absolute`，`..` 不折叠、符号链接不消解 | 需同步 | 新增 `crate::resolve_path`（镜像 `Path.resolve(strict=False)`：绝对化、折叠 `.`/`..`（根处钳制）、规范已有前缀、保留尚不存在的尾部），应用于 `DeepSeekHarness::new`、`HarnessClient::start` 与 `initialize`。测试：符号链接工作区经 fake runtime 回读 wire/进程/`DSH_CWD` 三处均为真实路径，另有两组纯函数测试 |
-| 通知过滤器抛错 | Python 捕获 predicate 异常：移除该订阅、错误只投给该订阅，reader 与健康订阅继续 | Rust 过滤器 panic 会直接击穿 reader 任务，整个客户端挂起 | 需同步 | `catch_unwind` 隔离过滤器 panic：移除该订阅并向其投递 `SdkError::Protocol`（panic 消息），其他订阅与 unmatched 队列不受影响。测试：broken + healthy 两订阅同场验证 |
-| 帧 id 分类 | Python/TS transport 只把 string/number 当 id；`id` 为 null/bool 等且带 `method` 的帧按通知处理 | `id` 为任意 JSON 值且带 `method` 的帧被排队为 server→client 请求 | 需同步 | reader 先判 `valid_id`（string/number），其余带 `method` 帧走通知路径。测试：fake runtime 发 `{"id":null,"method":"tick"}`，客户端收到通知且请求队列为空 |
-| 负 `request_timeout_seconds` | Python 的 deadline 立即过期，首个等待切片即超时 | `Duration::from_secs_f64(-x)` panic | 需同步（盘点中发现） | 配置与逐次超时统一钳制为 ≥ 0（立即超时语义）。测试覆盖负配置 |
-| `request()` 返回形状 | Python `request()` 要求 `response_model`（pydantic 校验，非 dict 抛 `TypeError`） | rs `request()` 返回原始 `Value`；`initialize`/`session_prompt` 做有类型的结构校验 | 有意保留 | 不复刻 `response_model`。Rust 侧裸 `Value` 是刻意保留的低层扩展，类型化方法提供同等校验；`session_prompt` 缺 `messageId` 映射为 `SdkError::Protocol`（Python 会漏出 pydantic 异常，rs 归口到自身错误分类） |
-| `bridge_bin` 启动通道 | `HarnessConfig.bridge_bin`（开发用 bridge 脚本） | 无该字段，有更通用的 `command`+`args` | 有意保留 | `command`+`args` 覆盖任意可执行程序与参数，语义是 `bridge_bin` 的超集 |
-| 订阅 API 命名 | `subscribe_notifications(filter)` / `subscribe_session_notifications(id)` | `subscribe(filter)` / `subscribe_session_tree(id)` | 有意保留 | Rust 命名惯例；语义与过滤逻辑逐项一致 |
-| 启动前订阅 | Python 允许 start 前建订阅（队列在运行后生效） | start 前 `subscribe` 返回 `TransportClosed` | 有意保留 | 失败快速、不暴露无 peer 状态的订阅；正常用法（start 后订阅 / 高层 run）一致 |
-| close 后重启 | Python `close()` 后 `start()` 会再拉起进程（旧队列残留异常，属未设计行为） | close 后客户端永久拒绝复用 | 有意保留 | rs 的单次生命周期更强；官方并未承诺复用已关闭客户端 |
-| 默认 `cordis.yml` 注入 | 仅 bundled runtime 解析成功且无非空 `DSH_CORDIS_CONFIG` 时注入；显式 `runtime_bin`/`bridge_bin`/`launch_args_override` 禁用 | 仅下载器解析成功且无非空配置时注入，显式通道禁用 | 已对齐（复核） | 不动作；机制测试已钉住两种路径 |
-| 通知/请求队列 | `next_notification`、`next_request`、`respond`/`respond_error`、请求 id 原样回显、subagent 血缘跨订阅保留 | 同名能力均已实现，含血缘 interceptor 与 slot-0 unmatched 队列 | 已对齐（复核） | 不动作；新增 panic 隔离与 id 分类测试加固 |
-| 错误分类 | `HarnessError` 下 `JsonRpcError`/`TimeoutError`/`SdkProtocolError`/`TransportClosedError` | `SdkError::{JsonRpcResponse, RequestTimeout, Protocol, TransportClosed}` + `Io`/`RuntimeResolve`/`NestedRuntime` 扩展 | 已对齐（复核） | 不动作；超时诊断同步后 message 语义也一致 |
-| 官方新增内容 | `git log --oneline -20` 中 sdk 相关提交：`release(dsh): 0.1.0-rc.5`、`publish the dsh family publicly`、`apply repository naming contract`（均为版本号/命名/发布面改动） | 不涉及客户端行为 | 官方新增需跟进 | 无需要跟进的功能变化；`serverInfo.name = deepseek-harness-sdk-runtime` 协议常量不变，rs 测试继续钉住 |
-| 运行时 node 载具（`DSH_RUNTIME_MODE=node`） | 官方仓库内开发验证通道，不进 wheel 发行 | rs 下载器只解析 wheel 内 exe | 有意保留 | wheel 发行物不含 node 闭包；对 PyPI 消费者不构成能力缺口 |
+| 启动模型 | `dsh --profile <name> [--patch <path>]…`；每次启动要求显式 `dsh_home` 或非空 `DSH_HOME`，绝不发现 `~/.dsh` | 单文件 exe，无 profile/patch，自动注入 wheel 内 `cordis.yml` | 需同步 | 引入 `profile`/`patches`/`dsh_home`；托管启动追加 `--profile`/`--patch` 并校验 `DSH_HOME`；删除 `cordis`/`session_root`/`DSH_CWD` 注入 |
+| wheel 布局 | `deepseek-harness-sdk-runtime-<platform>-<arch>`、`-rg` sidecar、macOS `-spawn-helper`、`<platform>/` 资源目录 | 旧 exe 名 `dsh-jsonrpc-agent-pkg-*`，只取 exe/helper/cordis.yml | 需同步 | 提取 `deepseek_harness_runtime/runtime/` 下全部 payload（跳过 repo-only `node/`），保留权限；缓存校验 exe + sidecar + helper |
+| 平台映射 | macOS arm64/x64、Linux x64/arm64、Windows x64 | macOS arm64、Linux x64/arm64；缺 x64 mac 与 Windows | 需同步 | 增加 macOS x64 与 Windows x64 wheel 标签；错误消息列出全部支持目标 |
+| `initialize` 参数 | `reasoningEffort`、`maxTokens`、`approvalRequests`、`capabilities.userQuestions` | 只有 `maxTokens` | 需同步 | `InitializeParams` 增加 `reasoning_effort`/`approval_requests`；安装提问处理器时自动声明 `capabilities` |
+| 初始化超时 | 独立 `initialize_timeout_seconds`（默认 30s）；超时消息带所选 profile；失败关闭运行时 | 只有配置级/逐次请求超时 | 需同步 | 两套配置增加 `initialize_timeout_seconds`；`initialize` 使用独立 deadline，超时追加 `selected dsh profile …`，失败统一 `close()` |
+| 原生用户提问 | `user-question/ask` server→client 请求；回调带取消句柄；非法批次/重复 requestId `-32602`，回调失败 `-32603`；取消/关闭抑制迟到答案 | 请求只排队给 `next_request()`，无提问类型或取消 | 需同步 | 新增 `UserQuestionHandler`/`UserQuestionRequest`/`UserQuestionAnswer`/`UserQuestionCancellation`；reader 拦截并分发到独立任务；`user-question.cancelled` 与 `close()` 取消；迟到答案抑制 |
+| 客户端审批 | `approval/request` server→client 请求；`approvalRequests: true` 显式开启；一次性决定 `allowed-once`/`rejected`/`cancelled` | 已有通用 `next_request`/`respond`，无类型模型或 initialize 开关 | 需同步 | 新增 `ApprovalRequestParams`/`ApprovalRequestResult`/`ApprovalOutcome`；`InitializeParams.approval_requests` |
+| `session/resume` | 从持久 home 恢复会话，不发送输入；缺失/不可读/不兼容/占用都拒绝 | 无 | 需同步 | `HarnessClient::resume_session` + `DeepSeekHarness::resume_session` + sync 门面 |
+| `session/wait` | 等待 SDK 会话及其托管后代结算；未知会话拒绝 | 无类型化方法 | 需同步 | `HarnessClient::session_wait` |
+| 工作目录 | `session/working-directory/get|set`；读写有效目录，set 返回校验后的绝对路径 | 无 | 需同步 | 低层 get/set；高层 `Session::get_working_directory`/`set_working_directory` |
+| `RunResult.session_root` | 官方无此字段；home 由 `dsh_home` 拥有 | 暴露旧的 `DSH_SESSION_ROOT` | 需同步 | 删除字段与配置项 |
+| `subagent.finished.lastAssistantMessage` | 子代理最后一条非空助手消息（或累计文本） | 载荷透传，示例已读取 | 已对齐（复核） | 不动作；示例继续渲染该字段 |
+| `RunResult.finish_reason` | 最后一条根会话 `turn/end` 的 `data.reason.kind`；缺失 kind 报协议错误 | 已实现 | 已对齐（复核） | 不动作；测试继续钉住 |
+| 通知过滤 panic | 只移除该订阅并向其投递错误 | 已实现 | 已对齐（复核） | 不动作 |
+| 帧 id 分类 | 只有 string/number 算 id | 已实现 | 已对齐（复核） | 不动作 |
+| 逐次请求超时 | `request(..., timeout_seconds=X)` 覆盖配置 | `request_with_timeout` 已实现 | 已对齐（复核） | 不动作 |
+| 超时诊断 | exit code + 400 行 stderr tail | 已实现 | 已对齐（复核） | 不动作 |
+| `cwd`/`runtime_cwd` 解析 | `Path.resolve()` 语义 | `resolve_path` 已实现 | 已对齐（复核） | 不动作 |
+| `env` 语义 | Python 叠加在继承环境上；TS 完整替换 | Rust 叠加，与 Python 一致 | 有意保留 | 不动作 |
+| `dsh_bin` 命名 | Python `dsh_bin` | Rust `runtime_bin`（语义相同） | 有意保留 | 不动作 |
+| 显式 argv 通道 | Python `_launch_args` 仅内部测试适配器 | Rust `launch_args_override`/`command`+`args` 公开且原样发送 | 有意保留 | 不动作；文档标明显式通道不追加 profile/patch、不要求 `DSH_HOME` |
+| close 后重启 | Python close 后可再 `start()` 拉起新进程 | closed client 永久拒绝复用 | 有意保留 | 不复刻；文档明确需要新进程时新建 harness |
+| `session_prompt` 等待期间 drain 通知 | Python 在轮询切片里 drain 订阅 | Rust 由调用方显式驱动订阅；高层 `run()` 区间语义一致 | 有意保留 | 不动作 |
+| Office 操作 | Python `office.py` 调单独下载的 Kit CLI，不走 wire 协议 | 无 | 有意保留 | 不复刻；Rust crate 不打包/下载 Office 资源 |
+| 协议版本协商 | 只报告 `serverInfo.version`（`0.0.1`），不校验 | 一致 | 已对齐（复核） | 不动作 |
 
 ## Implemented
 
-- `HarnessClient::request_with_timeout` — per-call timeout override; `None` keeps the
-  configured deadline.
-- Timeout diagnostics — `RequestTimeout.message` now carries exit code + bounded
-  stderr tail in Python's format.
-- `crate::resolve_path` — Python `Path.resolve(strict=False)` semantics for
-  `cwd`/`runtime_cwd` at API construction, subprocess launch, and the wire handshake.
-- Filter panic containment — a panicking `NotificationFilter` is removed and its
-  subscription receives a `Protocol` error; the reader and other subscriptions keep
-  working.
-- Frame classification — only string/number ids make a frame a request or response;
-  other id shapes with a `method` are notifications.
-- Negative timeout clamping — immediate timeout instead of a panic.
+- **Profile launch** — `dsh_home`, `profile` (default `sdk`), and ordered
+  `patches` on both config layers; managed launches append `--profile` and
+  `--patch` and require an explicit home. `DSH_CORDIS_CONFIG`,
+  `DSH_SESSION_ROOT`, and `DSH_CWD` injection are gone.
+- **Runtime acquisition** — new executable and sidecar names, macOS x64 and
+  Windows x64 wheel mappings, full `runtime/` payload extraction (including
+  platform resources, excluding the dev-only `node/` carrier), executable
+  permissions, and cache validation covering the ripgrep sidecar and macOS
+  spawn helper.
+- **Handshake** — `reasoningEffort`, `approvalRequests`, and
+  `capabilities.userQuestions`; independent initialize deadline naming the
+  selected profile on timeout; failed handshakes close the runtime.
+- **Native user questions** — typed request/answer/cancellation surface, async
+  handler tasks, validation and duplicate handling, cancellation on
+  `user-question.cancelled` and `close()`, suppression of late answers, and a
+  0.5-second cooperative shutdown window.
+- **Approvals** — typed params/result/outcome models and the initialize opt-in;
+  the existing `next_request`/`respond` queue carries the request.
+- **Sessions** — `resume_session` on the low-level client, the high-level
+  harness, and the blocking facade; `session_wait` and typed
+  working-directory reads/changes on the low-level client and high-level
+  session.
+- **Result shape** — `RunResult.session_root` removed.
 
 ## Tests
 
-Mechanism tier extended in `sdk/tests/{client,api}.rs` with new
-`dsh-fake-runtime` scenarios (`ticks`, `invalid-id-notification`, `cwd`,
-`reject-prompt`, slow-request behavior):
+The mechanism tier now covers the new surface through `dsh-fake-runtime`
+scenarios (`launch`, `capability`, `approval`, `session`, `slow-initialize`,
+`user-question`, `user-question-cancel`, `user-question-invalid`):
 
-- `per_call_timeout_override_replaces_the_config_for_one_request`
-- `request_timeout_fires_after_the_deadline` (now asserts stderr diagnostics)
-- `negative_timeouts_clamp_to_immediate`
-- `panicking_filters_are_contained_to_their_subscription`
-- `frames_with_invalid_ids_are_notifications_not_requests`
-- `session_prompt_rejects_a_missing_message_id`
-- `cwd_and_runtime_cwd_resolve_before_launch_and_handshake` (Unix symlinks)
-- `resolve_path_collapses_parent_components_like_python` and
-  `resolve_path_clamps_parent_components_at_the_root` (lib unit tests)
+- `initialize_advertises_question_capability_and_approval_opt_in`
+- `initialize_without_a_handler_does_not_advertise_questions`
+- `initialize_timeout_names_the_selected_profile`
+- `missing_dsh_home_is_a_config_error`
+- `managed_launch_sets_home_profile_and_patches`
+- `explicit_launch_sends_argv_verbatim`
+- `approval_request_round_trips_one_shot_decisions`
+- `user_question_handler_answers_and_preserves_metadata`
+- `user_question_handler_failure_becomes_a_protocol_error`
+- `user_question_cancellation_reaches_the_handler`
+- `invalid_user_question_receives_invalid_params`
+- `session_helpers_round_trip`
+- `resume_and_working_directory_helpers_round_trip`
+- `sync_facade_resumes_a_session`
+- `run_carries_native_user_questions_through_the_handler`
+- Downloader: new wheel payload extraction, sidecar permissions, `node/`
+  exclusion, managed `--profile sdk` + `DSH_HOME`, and no legacy `cordis.yml`
+  injection.
+- Smoke: one turn through a scripted Messages model, and a persisted-session
+  resume through a second runtime process sharing the same `DSH_HOME`.
 
 Validation: `cargo fmt --all --check`, `cargo clippy --all-targets --features
-test-support -- -D warnings`, `cargo test --features test-support` all green
-(10 unit + 10 api + 22 client + 6 downloader + smoke + doctests). The change set
-does not touch runtime download/zero-config resolution, so the `resolve` example
-behavior is unchanged.
+test-support -- -D warnings`, and `cargo test --features test-support` are green
+(10 unit + 13 api + 34 client + 5 downloader + 2 smoke + doctest). The keyless
+smoke was run locally against the real `0.2.1rc2` executable and passed; the
+download path was exercised through `cargo run --example resolve` against PyPI,
+which extracted the executable, `-rg` sidecar, and `linux-x64/` resources, and
+the same smoke passed against that cache entry.

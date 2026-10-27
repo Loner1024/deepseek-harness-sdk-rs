@@ -53,7 +53,7 @@ jobs:
     env:
       # Pinned to the runtime wheel the smoke scenario was written against;
       # bump together with the runtime release.
-      DSH_RUNTIME_VERSION: 0.1.0rc6
+      DSH_RUNTIME_VERSION: 0.2.1rc2
       DSH_RUNTIME_CACHE_DIR: /tmp/dsh-runtime-cache
     steps:
       - uses: actions/checkout@v6
@@ -74,10 +74,8 @@ jobs:
           cargo run --package deepseek-harness-sdk-rs --example resolve > "$RUNNER_TEMP/resolve.out"
           cat "$RUNNER_TEMP/resolve.out"
           echo "exe=$(sed -n 's/^exe=//p' "$RUNNER_TEMP/resolve.out")" >> "$GITHUB_OUTPUT"
-          echo "cordis=$(sed -n 's/^cordis=//p' "$RUNNER_TEMP/resolve.out")" >> "$GITHUB_OUTPUT"
 
       - name: Keyless smoke
         env:
           DSH_TEST_RUNTIME_EXE: ${{ steps.runtime.outputs.exe }}
-          DSH_TEST_CORDIS_CONFIG: ${{ steps.runtime.outputs.cordis }}
         run: cargo test --features test-support --test smoke

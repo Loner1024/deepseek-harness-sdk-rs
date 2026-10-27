@@ -1,4 +1,4 @@
-//! Resolve the platform runtime through the downloader and print its paths.
+//! Resolve the platform runtime through the downloader and print its path.
 //!
 //! ```sh
 //! cargo run --package deepseek-harness-sdk-rs --example resolve
@@ -18,7 +18,6 @@ fn main() {
     }) {
         Ok(resolved) => {
             println!("exe={}", resolved.launch_args[0]);
-            println!("cordis={}", resolved.default_config.display());
         }
         Err(error) => {
             eprintln!("resolve failed: {error}");

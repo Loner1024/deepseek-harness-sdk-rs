@@ -11,9 +11,17 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use deepseek_harness_sdk_rs::runtime::{ResolveOptions, resolve};
-use deepseek_harness_sdk_rs::{DeepSeekHarness, DeepSeekHarnessConfig, RunOptions, SdkError};
+use deepseek_harness_sdk_rs::{
+    DeepSeekHarness, DeepSeekHarnessConfig, InitializeParams, RunOptions, SdkError,
+};
 
-fn build_wheel(exe_name: &str, exe_bytes: &[u8], macos: bool) -> Vec<u8> {
+fn build_wheel(
+    exe_name: &str,
+    sidecar: &str,
+    platform_dir: &str,
+    exe_bytes: &[u8],
+    macos: bool,
+) -> Vec<u8> {
     let mut buffer = Cursor::new(Vec::new());
     {
         let mut zip = zip::ZipWriter::new(&mut buffer);
@@ -24,6 +32,12 @@ fn build_wheel(exe_name: &str, exe_bytes: &[u8], macos: bool) -> Vec<u8> {
         )
         .expect("start exe");
         zip.write_all(exe_bytes).expect("write exe");
+        zip.start_file(
+            format!("deepseek_harness_runtime/runtime/{sidecar}"),
+            options,
+        )
+        .expect("start sidecar");
+        zip.write_all(b"ripgrep").expect("write sidecar");
         if macos {
             zip.start_file(
                 format!("deepseek_harness_runtime/runtime/{exe_name}-spawn-helper"),
@@ -32,9 +46,34 @@ fn build_wheel(exe_name: &str, exe_bytes: &[u8], macos: bool) -> Vec<u8> {
             .expect("start helper");
             zip.write_all(b"helper").expect("write helper");
         }
+        zip.start_file(
+            format!("deepseek_harness_runtime/runtime/{platform_dir}/downloads.json"),
+            options,
+        )
+        .expect("start downloads");
+        zip.write_all(b"{}").expect("write downloads");
+        zip.start_file(
+            format!(
+                "deepseek_harness_runtime/runtime/{platform_dir}/office-skills/office/SKILL.md"
+            ),
+            options,
+        )
+        .expect("start skill");
+        zip.write_all(b"# Office\n").expect("write skill");
+        // The repo-only Node carrier is excluded from the wheel payload; a
+        // fixture copy proves extraction skips it.
+        zip.start_file(
+            "deepseek_harness_runtime/runtime/node/runtime-bootstrap.mjs",
+            options,
+        )
+        .expect("start node carrier");
+        zip.write_all(b"// dev carrier\n")
+            .expect("write node carrier");
+        // A legacy default composition must not be injected anywhere.
         zip.start_file("deepseek_harness_runtime/runtime/cordis.yml", options)
-            .expect("start config");
-        zip.write_all(b"plugins: []\n").expect("write config");
+            .expect("start legacy config");
+        zip.write_all(b"plugins: []\n")
+            .expect("write legacy config");
         zip.finish().expect("finish");
     }
     buffer.into_inner()
@@ -111,11 +150,22 @@ fn wheel_filename() -> String {
     )
 }
 
+fn fixture_wheel() -> (Vec<u8>, String, String, bool) {
+    let exe_bytes = std::fs::read(common::fake_runtime()).expect("fake runtime binary");
+    let (exe_name, sidecar, macos) = common::platform_exe();
+    let wheel = build_wheel(
+        &exe_name,
+        &sidecar,
+        common::platform_dir(),
+        &exe_bytes,
+        macos,
+    );
+    (wheel, exe_name, sidecar, macos)
+}
+
 #[tokio::test]
 async fn resolver_extracts_verified_runtime_and_drives_a_turn() {
-    let exe_bytes = std::fs::read(common::fake_runtime()).expect("fake runtime binary");
-    let (exe_name, macos) = common::platform_exe();
-    let wheel = build_wheel(&exe_name, &exe_bytes, macos);
+    let (wheel, exe_name, sidecar, _macos) = fixture_wheel();
     let (base, _hits, thread) = start_server(wheel_filename(), wheel.clone(), sha256_hex(&wheel));
     let cache = tempfile::TempDir::new().expect("tempdir");
 
@@ -130,12 +180,20 @@ async fn resolver_extracts_verified_runtime_and_drives_a_turn() {
     let exe_path = PathBuf::from(&resolved.launch_args[0]);
     assert!(exe_path.ends_with(&exe_name));
     assert!(exe_path.is_file());
-    assert_eq!(
-        resolved.default_config,
-        cache.path().join("9.9.9").join("cordis.yml")
+    let cache_dir = cache.path().join("9.9.9");
+    assert!(cache_dir.join(&sidecar).is_file(), "ripgrep sidecar");
+    assert!(
+        cache_dir
+            .join(common::platform_dir())
+            .join("downloads.json")
+            .is_file(),
+        "platform resource directory"
     );
-    assert!(resolved.default_config.is_file());
-    assert!(cache.path().join("9.9.9").join(".complete").is_file());
+    assert!(
+        !cache_dir.join("node").exists(),
+        "the repo-only Node carrier must not be extracted"
+    );
+    assert!(cache_dir.join(".complete").is_file());
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -144,11 +202,23 @@ async fn resolver_extracts_verified_runtime_and_drives_a_turn() {
             .permissions()
             .mode();
         assert_ne!(mode & 0o111, 0, "extracted runtime must be executable");
+        let sidecar_mode = std::fs::metadata(cache_dir.join(&sidecar))
+            .expect("sidecar metadata")
+            .permissions()
+            .mode();
+        assert_ne!(
+            sidecar_mode & 0o111,
+            0,
+            "extracted sidecar must be executable"
+        );
     }
 
-    // The downloaded "runtime" is the fake runtime: a full turn runs through it.
+    // The downloaded "runtime" is the fake runtime: a full turn runs through
+    // the managed launch, which appends `--profile sdk`.
+    let home = tempfile::TempDir::new().expect("home");
     let harness = DeepSeekHarness::new(DeepSeekHarnessConfig {
         runtime_bin: Some(exe_path),
+        dsh_home: Some(home.path().to_path_buf()),
         ..Default::default()
     });
     let result = harness
@@ -163,9 +233,7 @@ async fn resolver_extracts_verified_runtime_and_drives_a_turn() {
 
 #[tokio::test]
 async fn resolver_reuses_a_verified_cache() {
-    let exe_bytes = std::fs::read(common::fake_runtime()).expect("fake runtime binary");
-    let (exe_name, macos) = common::platform_exe();
-    let wheel = build_wheel(&exe_name, &exe_bytes, macos);
+    let (wheel, _exe_name, _sidecar, _macos) = fixture_wheel();
     let (base, hits, thread) = start_server(wheel_filename(), wheel.clone(), sha256_hex(&wheel));
     let cache = tempfile::TempDir::new().expect("tempdir");
     let options = ResolveOptions {
@@ -188,9 +256,7 @@ async fn resolver_reuses_a_verified_cache() {
 
 #[tokio::test]
 async fn resolver_rejects_a_digest_mismatch() {
-    let exe_bytes = std::fs::read(common::fake_runtime()).expect("fake runtime binary");
-    let (exe_name, macos) = common::platform_exe();
-    let wheel = build_wheel(&exe_name, &exe_bytes, macos);
+    let (wheel, _exe_name, _sidecar, _macos) = fixture_wheel();
     let bad_digest = "ab".repeat(32);
     let (base, _hits, thread) = start_server(wheel_filename(), wheel, bad_digest);
     let cache = tempfile::TempDir::new().expect("tempdir");
@@ -212,9 +278,7 @@ async fn resolver_rejects_a_digest_mismatch() {
 
 #[tokio::test]
 async fn resolver_fails_loud_without_a_matching_wheel() {
-    let exe_bytes = std::fs::read(common::fake_runtime()).expect("fake runtime binary");
-    let (exe_name, macos) = common::platform_exe();
-    let wheel = build_wheel(&exe_name, &exe_bytes, macos);
+    let (wheel, _exe_name, _sidecar, _macos) = fixture_wheel();
     let foreign = "deepseek_harness_runtime_bin-9.9.9-py3-none-fake_platform.whl".to_string();
     let (base, _hits, thread) = start_server(foreign, wheel.clone(), sha256_hex(&wheel));
     let cache = tempfile::TempDir::new().expect("tempdir");
@@ -231,85 +295,62 @@ async fn resolver_fails_loud_without_a_matching_wheel() {
 }
 
 #[tokio::test]
-async fn zero_config_injects_the_extracted_default_config() {
-    let exe_bytes = std::fs::read(common::fake_runtime()).expect("fake runtime binary");
-    let (exe_name, macos) = common::platform_exe();
-    let wheel = build_wheel(&exe_name, &exe_bytes, macos);
+async fn downloaded_runtime_receives_profile_and_home() {
+    let (wheel, _exe_name, _sidecar, _macos) = fixture_wheel();
     let (base, _hits, thread) = start_server(wheel_filename(), wheel.clone(), sha256_hex(&wheel));
     let cache = tempfile::TempDir::new().expect("tempdir");
+    let home = tempfile::TempDir::new().expect("home");
 
-    // The downloader resolves the runtime (the downloaded fake binary reads
-    // $DSH_FAKE_SCENARIO and runs the `env` scenario, which echoes the
-    // injected $DSH_CORDIS_CONFIG back through serverInfo.version).
     let harness = DeepSeekHarness::new(DeepSeekHarnessConfig {
         runtime_index_url: Some(format!("http://{base}/pypi")),
         runtime_version: Some("9.9.9".to_string()),
         runtime_cache_dir: Some(cache.path().to_path_buf()),
+        dsh_home: Some(home.path().to_path_buf()),
         env: [
+            ("DSH_FAKE_SCENARIO".to_string(), "launch".to_string()),
             ("DSH_CORDIS_CONFIG".to_string(), String::new()),
-            ("DSH_FAKE_SCENARIO".to_string(), "env".to_string()),
         ]
         .into_iter()
         .collect(),
         ..Default::default()
     });
     harness.start().await.expect("start");
-    let info = harness
+    let report = harness
         .client()
-        .initialize(&deepseek_harness_sdk_rs::InitializeParams {
+        .initialize(&InitializeParams {
             cwd: std::env::current_dir().expect("cwd"),
             provider: "p".to_string(),
             model: "m".to_string(),
+            reasoning_effort: None,
             max_tokens: None,
+            approval_requests: false,
         })
         .await
-        .expect("second initialize");
-    let version = info
-        .server_info
-        .expect("serverInfo")
-        .version
-        .expect("version");
+        .expect("launch report");
+    let report: serde_json::Value = serde_json::from_str(
+        report
+            .server_info
+            .expect("serverInfo")
+            .version
+            .expect("version")
+            .as_str(),
+    )
+    .expect("launch report JSON");
     assert_eq!(
-        version,
-        cache
-            .path()
-            .join("9.9.9")
-            .join("cordis.yml")
-            .to_string_lossy()
+        report.get("args"),
+        Some(&serde_json::json!(["--profile", "sdk"]))
+    );
+    let expected_home = home.path().canonicalize().expect("canonical home");
+    assert_eq!(
+        report.get("dsh_home").and_then(|value| value.as_str()),
+        expected_home.to_str()
+    );
+    assert_eq!(
+        report.get("cordis"),
+        Some(&serde_json::Value::Null),
+        "the legacy cordis.yml must not be injected"
     );
     harness.close().await;
 
     drop(thread);
-}
-
-#[tokio::test]
-async fn explicit_launch_skips_default_config_injection() {
-    let harness = DeepSeekHarness::new(DeepSeekHarnessConfig {
-        launch_args_override: Some(vec![common::fake_runtime(), "env".to_string()]),
-        env: [("DSH_CORDIS_CONFIG".to_string(), String::new())]
-            .into_iter()
-            .collect(),
-        ..Default::default()
-    });
-    harness.start().await.expect("start");
-    let info = harness
-        .client()
-        .initialize(&deepseek_harness_sdk_rs::InitializeParams {
-            cwd: std::env::current_dir().expect("cwd"),
-            provider: "p".to_string(),
-            model: "m".to_string(),
-            max_tokens: None,
-        })
-        .await
-        .expect("second initialize");
-    let version = info
-        .server_info
-        .expect("serverInfo")
-        .version
-        .expect("version");
-    assert_eq!(
-        version, "",
-        "no default config may be injected for an explicit launch"
-    );
-    harness.close().await;
 }

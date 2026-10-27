@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use deepseek_harness_sdk_rs::{
     DeepSeekHarness, DeepSeekHarnessConfig, DeepSeekHarnessSync, InitializeParams, RunOptions,
-    SdkError,
+    SdkError, UserQuestionAnswer, UserQuestionAnswerItem, UserQuestionHandler,
 };
 use serde_json::json;
 
@@ -148,20 +148,25 @@ async fn cwd_and_runtime_cwd_resolve_before_launch_and_handshake() {
         launch_args_override: Some(vec![common::fake_runtime(), "cwd".to_string()]),
         cwd: Some(workspace_link.clone()),
         runtime_cwd: Some(runtime_link.clone()),
+        env: [("DSH_CWD".to_string(), String::new())]
+            .into_iter()
+            .collect(),
         ..Default::default()
     });
     harness.start().await.expect("start resolves both paths");
 
     // The fake `cwd` scenario reports the wire cwd, the subprocess cwd, and
-    // `$DSH_CWD`; all three must be the symlink-resolved targets, matching
-    // Python's `Path.resolve()` semantics.
+    // `$DSH_CWD`; the first two must be the symlink-resolved targets, matching
+    // Python's `Path.resolve()` semantics, and `$DSH_CWD` must stay unset.
     let report = harness
         .client()
         .initialize(&InitializeParams {
             cwd: workspace_link,
             provider: "p".to_string(),
             model: "m".to_string(),
+            reasoning_effort: None,
             max_tokens: None,
+            approval_requests: false,
         })
         .await
         .expect("second initialize");
@@ -183,8 +188,9 @@ async fn cwd_and_runtime_cwd_resolve_before_launch_and_handshake() {
         runtime_dir.to_str()
     );
     assert_eq!(
-        report.get("env").and_then(|value| value.as_str()),
-        workspace.to_str()
+        report.get("env"),
+        Some(&serde_json::Value::Null),
+        "the SDK no longer injects DSH_CWD"
     );
     harness.close().await;
 }
@@ -210,4 +216,78 @@ fn sync_facade_rejects_an_async_context() {
     });
     drop(runtime);
     sync.close().expect("close outside the async context");
+}
+
+#[tokio::test]
+async fn resume_and_working_directory_helpers_round_trip() {
+    let harness = DeepSeekHarness::new(harness_config("session"));
+    let session = harness
+        .resume_session("saved-session")
+        .await
+        .expect("resume_session");
+    assert_eq!(session.id(), "saved-session");
+    assert_eq!(
+        session
+            .get_working_directory()
+            .await
+            .expect("get directory"),
+        "/fake/saved-session"
+    );
+    assert_eq!(
+        session
+            .set_working_directory("/tmp/workspace")
+            .await
+            .expect("set directory"),
+        "/tmp/workspace"
+    );
+    harness.close().await;
+}
+
+#[tokio::test]
+async fn run_carries_native_user_questions_through_the_handler() {
+    let seen = Arc::new(std::sync::Mutex::new(None));
+    let captured = seen.clone();
+    let harness = DeepSeekHarness::new(DeepSeekHarnessConfig {
+        launch_args_override: Some(vec![common::fake_runtime(), "user-question".to_string()]),
+        on_user_question: Some(UserQuestionHandler::new(move |request, _cancellation| {
+            *captured.lock().unwrap() = Some(request.clone());
+            async move {
+                Ok(UserQuestionAnswer {
+                    answers: vec![UserQuestionAnswerItem {
+                        id: "format".to_string(),
+                        selected: vec!["CSV".to_string()],
+                        custom: None,
+                    }],
+                })
+            }
+        })),
+        ..Default::default()
+    });
+    let result = harness
+        .run(
+            "hi",
+            &RunOptions {
+                session_id: Some("session-questions"),
+                on_notification: None,
+            },
+        )
+        .await
+        .expect("run");
+    assert_eq!(result.final_response, "hello from fake");
+    let question = seen.lock().unwrap().clone().expect("handler ran");
+    assert_eq!(question.request_id, "ask-1");
+    assert_eq!(question.session_id, "session-questions");
+    assert_eq!(
+        question.questions[0].get("intent"),
+        Some(&json!({"kind": "plan-review", "approve": "CSV"}))
+    );
+    harness.close().await;
+}
+
+#[test]
+fn sync_facade_resumes_a_session() {
+    let sync = DeepSeekHarnessSync::new(harness_config("session")).expect("sync facade");
+    let session = sync.resume_session("saved-session").expect("resume");
+    assert_eq!(session.id(), "saved-session");
+    sync.close().expect("sync close");
 }

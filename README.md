@@ -2,7 +2,7 @@
 
 English | [中文](README.zh.md)
 
-Rust SDK for driving DeepSeek Harness. The SDK spawns the harness runtime as a subprocess and speaks the line-delimited JSON-RPC 2.0 protocol over its stdio. The runtime is the single-file executable distributed with the [Python SDK](https://github.com/deepseek-ai/deepseek-harness/blob/master/python/README.md); the Rust client is a clean-room reimplementation of the protocol, mirroring the Python SDK's layering.
+Rust SDK for driving DeepSeek Harness. The SDK spawns the packaged `dsh` CLI (`--profile sdk`) as a subprocess and speaks the line-delimited JSON-RPC 2.0 protocol over its stdio. The CLI and its sidecars are distributed in the `deepseek-harness-runtime-bin` wheel also used by the [Python SDK](https://github.com/deepseek-ai/deepseek-harness/blob/master/python/README.md); the Rust client is a clean-room reimplementation of the protocol, mirroring the Python SDK's layering.
 
 ## Packages
 
@@ -12,25 +12,28 @@ Rust SDK for driving DeepSeek Harness. The SDK spawns the harness runtime as a s
 
 ## Behavior
 
-The SDK launches the runtime lazily and owns it across `run()` calls. With no explicit launch channel, the `runtime-download` feature (default) fetches the platform runtime wheel from a PyPI-style index, verifies its digest, and caches the executable; explicit `runtime_bin` or `command`/`args` callers can disable the feature. Low-level parity with the Python SDK includes per-call request timeout overrides (`request_with_timeout`), timeout diagnostics from the runtime's stderr tail, symlink-resolved `cwd`/`runtime_cwd` handling, and notification-filter failure containment. [SDK reference](sdk/README.md) covers lifecycle, results, notifications, runtime selection, configuration, and errors.
+The SDK launches the runtime lazily and owns it across `run()` calls. Managed launches require an explicit Harness home (`dsh_home` or a non-empty `DSH_HOME`); the SDK never discovers `~/.dsh` implicitly. Explicit `launch_args_override` callers own their argv and environment. The `sdk` profile and optional ordered `patches` are passed as `--profile`/`--patch` arguments. With no explicit launch channel, the `runtime-download` feature (default) fetches the platform runtime wheel from a PyPI-style index, verifies its digest, and caches the `dsh` executable, its ripgrep sidecar, and the platform resources; explicit `runtime_bin` or `command`/`args` callers can disable the feature.
+
+Low-level parity with the Python SDK includes per-call request timeout overrides, timeout diagnostics from the runtime's stderr tail, symlink-resolved `cwd`/`runtime_cwd` handling, notification-filter failure containment, native user questions with cancellation, opt-in approval requests, persisted session resume, session working-directory reads and changes, and `session/wait`. Initialization carries `reasoningEffort`, `maxTokens`, and the question/approval opt-ins. [SDK reference](sdk/README.md) covers lifecycle, results, notifications, runtime selection, configuration, and errors.
 
 ## Examples
 
 | Example | What it shows |
 |---|---|
-| `simple` | Zero-config one-task run. |
-| `resolve` | Resolve the platform runtime through the downloader and print its paths. |
-| `deep_research` | Deep research: `web_search`/`web_fetch` plus the subagent tool, with subagent reports rendered from the notification stream. |
+| `simple` | One-task run through the downloader; uses `$DSH_HOME` or a temporary home. |
+| `resolve` | Resolve the platform runtime through the downloader and print its path. |
+| `deep_research` | Deep research: `web_search`/`web_fetch` plus the subagent tool in the default `sdk` profile, with subagent reports rendered from the notification stream. |
 
 ```sh
 export DEEPSEEK_API_KEY=sk-your-key-here
+export DSH_HOME=/absolute/path/to/isolated-dsh-home
 cargo run --example deep_research -- "self-hosted vector databases"
 ```
 
 ## Relationship to DeepSeek Harness
 
-This repository is the standalone home of the Rust SDK. The runtime it drives is the single-file executable published as `deepseek-harness-runtime-bin` by the [DeepSeek Harness project](https://github.com/deepseek-ai/deepseek-harness); the SDK speaks that runtime's documented stdio JSON-RPC protocol and pins its own version of the runtime wheel for testing. Contributions land as pull requests to this repository, which also owns crates.io publication of `deepseek-harness-sdk-rs` through Trusted Publishing.
+This repository is the standalone home of the Rust SDK. The runtime it drives is the `dsh` CLI published as `deepseek-harness-runtime-bin` by the [DeepSeek Harness project](https://github.com/deepseek-ai/deepseek-harness); the SDK speaks that runtime's documented stdio JSON-RPC protocol and pins its own version of the runtime wheel for testing. The crate version tracks the targeted wheel release and is spelled PEP 440 for PyPI (`0.2.1-rc.2` → `0.2.1rc2`). Contributions land as pull requests to this repository, which also owns crates.io publication of `deepseek-harness-sdk-rs` through Trusted Publishing.
 
 ## Contributor workflow
 
-Build and test with `cargo fmt --all`, `cargo clippy --all-targets --features test-support -- -D warnings`, and `cargo test --features test-support`; the `test-support` feature builds the `dsh-fake-runtime` binary the mechanism-tier tests drive. CI runs the keyless smoke tier against the real runtime executable downloaded from PyPI; locally it self-skips without the runtime environment variables.
+Build and test with `cargo fmt --all`, `cargo clippy --all-targets --features test-support -- -D warnings`, and `cargo test --features test-support`; the `test-support` feature builds the `dsh-fake-runtime` binary the mechanism-tier tests drive. CI runs the keyless smoke tier against the real runtime executable downloaded from PyPI; locally it self-skips without `DSH_TEST_RUNTIME_EXE`.

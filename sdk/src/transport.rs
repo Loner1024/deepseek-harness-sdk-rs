@@ -19,12 +19,18 @@ use crate::client::{IncomingRequest, Notification};
 use crate::error::SdkError;
 
 /// Runs before each notification is fanned out to subscribers; the client
-/// uses it to record `subagent.started` lineage so session-tree filters see
-/// the updated relationships for the very notification that carries them.
+/// uses it to record `subagent.started` lineage and to cancel a pending
+/// native user question for `user-question.cancelled`.
 pub(crate) type Interceptor = Arc<dyn Fn(&Notification) + Send + Sync>;
 
 /// Per-subscription predicate, evaluated by the reader task.
 pub type NotificationFilter = Arc<dyn Fn(&Notification) -> bool + Send + Sync>;
+
+/// Runs before a server-to-client request is queued; returning `true` means
+/// the hook owns the request and the reader must not queue it. The client uses
+/// it to dispatch native `user-question/ask` requests to a handler task
+/// without blocking the reader.
+pub(crate) type RequestInterceptor = Arc<dyn Fn(&IncomingRequest) -> bool + Send + Sync>;
 
 type Pending = Arc<Mutex<HashMap<String, oneshot::Sender<Result<Value, SdkError>>>>>;
 
@@ -60,7 +66,8 @@ pub(crate) struct PeerShared {
     /// First terminal error; set once by [`Peer::fail_closed`].
     closed_err: std::sync::Mutex<Option<SdkError>>,
     /// Fired when the reader hits EOF or a write fails; the client's monitor
-    /// task resolves the rich [`SdkError::TransportClosed`] from it.
+    /// task resolves the rich [`SdkError::TransportClosed`] from it. Notified
+    /// with `notify_one` so a monitor starting after EOF still wakes.
     pub(crate) eof: Notify,
 }
 
@@ -87,6 +94,7 @@ impl Peer {
         mut stdin: W,
         stdout: R,
         intercept: Option<Interceptor>,
+        request_intercept: Option<RequestInterceptor>,
         request_timeout: Option<Duration>,
     ) -> Self
     where
@@ -142,6 +150,12 @@ impl Peer {
                             method: method.to_string(),
                             payload,
                         };
+                        if request_intercept
+                            .as_ref()
+                            .is_some_and(|hook| hook(&request))
+                        {
+                            continue;
+                        }
                         let _ = reader_shared.requests.send(IncomingMsg::Request(request));
                     }
                     (true, None) => {
@@ -229,7 +243,7 @@ impl Peer {
                     (false, None) => continue,
                 }
             }
-            reader_shared.eof.notify_waiters();
+            reader_shared.eof.notify_one();
         });
 
         let writer_shared = shared.clone();
@@ -240,7 +254,7 @@ impl Peer {
                         let mut frame = line.into_bytes();
                         frame.push(b'\n');
                         if stdin_write(&mut stdin, &frame).await.is_err() {
-                            writer_shared.eof.notify_waiters();
+                            writer_shared.eof.notify_one();
                             return;
                         }
                     }
@@ -470,7 +484,7 @@ impl Peer {
                 *slot = Some(error.clone());
             }
         }
-        self.shared.eof.notify_waiters();
+        self.shared.eof.notify_one();
         let pending: Vec<_> = {
             // std Mutex: no await inside the critical section.
             let map = self.pending.try_lock();

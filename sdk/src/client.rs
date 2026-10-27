@@ -1,22 +1,27 @@
 //! The low-level `HarnessClient`: the SDK protocol client underneath the
 //! high-level [`crate::api::DeepSeekHarness`] API. It owns the runtime
 //! subprocess, the `initialize`/`session_prompt`/`shutdown` requests, the
-//! notification subscription fan-out with session-tree scoping, and the
-//! shutdown ladder.
+//! notification subscription fan-out with session-tree scoping, native user
+//! questions, and the shutdown ladder.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::PathBuf;
+use std::future::Future;
+use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use serde_json::{Map, Value};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
-use tokio::sync::{Mutex, OnceCell};
+use tokio::sync::{Mutex, Notify, OnceCell};
 
 use crate::error::SdkError;
-use crate::transport::{Interceptor, NotificationFilter, NotificationSubscription, Peer};
+use crate::transport::{
+    Interceptor, NotificationFilter, NotificationSubscription, Peer, RequestInterceptor,
+};
 
 /// One server-to-client notification: the JSON-RPC method plus its payload
 /// object. Event payloads pass through verbatim.
@@ -49,8 +54,13 @@ pub struct InitializeParams {
     pub provider: String,
     /// Model name every SDK-created agent runs on.
     pub model: String,
+    /// Optional adapter-owned reasoning effort for the selected route.
+    pub reasoning_effort: Option<String>,
     /// Optional positive output-token cap for SDK-created agents.
     pub max_tokens: Option<u64>,
+    /// Opt in to server-to-client `approval/request` calls. Omission leaves
+    /// the runtime's composed approval answerers in control.
+    pub approval_requests: bool,
 }
 
 /// Wire-stable server identity returned by initialization.
@@ -69,26 +79,234 @@ pub struct ServerInfo {
     pub version: Option<String>,
 }
 
+/// Parameters of a server-to-client `approval/request` payload, after the
+/// client opted in with [`InitializeParams::approval_requests`].
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApprovalRequestParams {
+    /// Session owning the operation, including an in-process SDK descendant.
+    pub session_id: String,
+    /// Tool whose operation needs approval.
+    pub tool_name: String,
+    /// Exact tool call, when the asker supplied one.
+    pub call_id: Option<String>,
+    /// Asker-supplied explanation, when available.
+    pub reason: Option<String>,
+}
+
+/// One-shot approval decision; only [`ApprovalOutcome::AllowedOnce`] grants an
+/// operation, and grants never persist beyond it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ApprovalRequestResult {
+    /// The decision.
+    pub outcome: ApprovalOutcome,
+}
+
+/// The value of [`ApprovalRequestResult::outcome`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ApprovalOutcome {
+    /// Permit this one operation.
+    AllowedOnce,
+    /// Refuse the operation.
+    Rejected,
+    /// Abandon the operation without deciding.
+    Cancelled,
+}
+
+/// One native `user-question/ask` batch: the runtime's structured question
+/// request, with the original question objects preserved verbatim.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UserQuestionRequest {
+    /// Correlates cancellation with this request independently of the JSON-RPC id.
+    pub request_id: String,
+    /// Session whose tool is waiting.
+    pub session_id: String,
+    /// Original questions, including options, detail, and presentation intent.
+    pub questions: Vec<Value>,
+}
+
+impl UserQuestionRequest {
+    /// Read and validate the wire payload. Questions must retain a string `id`
+    /// and `question`; their remaining metadata passes through untouched.
+    fn from_payload(payload: &Value) -> Result<Self, ()> {
+        let object = payload.as_object().ok_or(())?;
+        let request_id = object
+            .get("requestId")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or(())?;
+        let session_id = object.get("sessionId").and_then(Value::as_str).ok_or(())?;
+        let questions = object
+            .get("questions")
+            .and_then(Value::as_array)
+            .filter(|questions| !questions.is_empty())
+            .ok_or(())?;
+        for question in questions {
+            let question = question.as_object().ok_or(())?;
+            if question.get("id").and_then(Value::as_str).is_none()
+                || question.get("question").and_then(Value::as_str).is_none()
+            {
+                return Err(());
+            }
+        }
+        Ok(Self {
+            request_id: request_id.to_string(),
+            session_id: session_id.to_string(),
+            questions: questions.clone(),
+        })
+    }
+}
+
+/// Answer to one native question batch; name every original question id once.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct UserQuestionAnswer {
+    /// One answer per original question.
+    pub answers: Vec<UserQuestionAnswerItem>,
+}
+
+/// Answer to one original question id, using selected option labels or custom text.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct UserQuestionAnswerItem {
+    /// Original question id.
+    pub id: String,
+    /// Selected option labels.
+    pub selected: Vec<String>,
+    /// Optional free text.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub custom: Option<String>,
+}
+
+struct CancellationInner {
+    cancelled: AtomicBool,
+    notify: Notify,
+}
+
+/// Cancellation handle passed to a [`UserQuestionHandler`]. Wait on
+/// [`Self::cancelled`] or poll [`Self::is_cancelled`] to release host work;
+/// a late answer cannot reach the runtime.
+#[derive(Clone)]
+pub struct UserQuestionCancellation {
+    inner: Arc<CancellationInner>,
+}
+
+impl UserQuestionCancellation {
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(CancellationInner {
+                cancelled: AtomicBool::new(false),
+                notify: Notify::new(),
+            }),
+        }
+    }
+
+    /// Whether the runtime cancelled the question or the client closed.
+    pub fn is_cancelled(&self) -> bool {
+        self.inner.cancelled.load(Ordering::SeqCst)
+    }
+
+    /// Resolve when the runtime cancels the question or the client closes.
+    pub async fn cancelled(&self) {
+        if self.is_cancelled() {
+            return;
+        }
+        let notified = self.inner.notify.notified();
+        if self.is_cancelled() {
+            return;
+        }
+        notified.await;
+    }
+
+    fn cancel(&self) {
+        if !self.inner.cancelled.swap(true, Ordering::SeqCst) {
+            self.inner.notify.notify_waiters();
+        }
+    }
+}
+
+impl std::fmt::Debug for UserQuestionCancellation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("UserQuestionCancellation")
+            .field("cancelled", &self.is_cancelled())
+            .finish()
+    }
+}
+
+type UserQuestionFuture = Pin<Box<dyn Future<Output = Result<UserQuestionAnswer, String>> + Send>>;
+
+/// Async callback for native user questions. The SDK advertises
+/// `capabilities.userQuestions` when one is installed and runs the callback
+/// outside the reader, so it may make further client requests. An `Err`
+/// message is returned to the runtime as JSON-RPC error `-32603`.
+#[derive(Clone)]
+pub struct UserQuestionHandler(
+    Arc<dyn Fn(UserQuestionRequest, UserQuestionCancellation) -> UserQuestionFuture + Send + Sync>,
+);
+
+impl UserQuestionHandler {
+    /// Wrap an async handler; the future must be `Send` and `'static`.
+    pub fn new<F, Fut>(handler: F) -> Self
+    where
+        F: Fn(UserQuestionRequest, UserQuestionCancellation) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<UserQuestionAnswer, String>> + Send + 'static,
+    {
+        Self(Arc::new(move |request, cancellation| {
+            Box::pin(handler(request, cancellation))
+        }))
+    }
+
+    fn call(
+        &self,
+        request: UserQuestionRequest,
+        cancellation: UserQuestionCancellation,
+    ) -> UserQuestionFuture {
+        (self.0)(request, cancellation)
+    }
+}
+
+impl std::fmt::Debug for UserQuestionHandler {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("UserQuestionHandler(..)")
+    }
+}
+
 /// How to launch the runtime subprocess and where its artifacts come from.
 #[derive(Clone, Debug)]
 pub struct HarnessClientOptions {
-    /// Explicit launch command; the most explicit channel beside `args`.
+    /// Explicit launch command; the argv is sent verbatim with `args` and
+    /// skips the managed `DSH_HOME` requirement.
     pub command: Option<String>,
     /// Arguments for the explicit `command`.
     pub args: Vec<String>,
-    /// Explicit path of the single-file runtime executable.
+    /// Explicit path of the packaged `dsh` executable. The client appends
+    /// `--profile` and `--patch` arguments and requires an explicit home.
     pub runtime_bin: Option<PathBuf>,
-    /// Explicit argv tuple; wins over every other launch channel.
+    /// Explicit argv tuple; wins over every other launch channel, is sent
+    /// verbatim without profile or patch arguments, and skips the managed
+    /// `DSH_HOME` requirement.
     pub launch_args_override: Option<Vec<String>>,
+    /// Harness profile to boot; default `sdk`.
+    pub profile: String,
+    /// Ordered profile patches, passed as `--patch <absolute path>`.
+    pub patches: Vec<PathBuf>,
+    /// Explicit Harness home; sets `DSH_HOME`. Managed launches require it
+    /// here or as a non-empty `$DSH_HOME`; the SDK never discovers `~/.dsh`.
+    pub dsh_home: Option<PathBuf>,
     /// Working directory of the spawned runtime.
     pub cwd: Option<PathBuf>,
     /// Extra environment entries, overlaid on the inherited environment.
     pub env: Option<HashMap<String, String>>,
+    /// Bound in seconds on the initial `initialize` handshake. Default `30.0`.
+    pub initialize_timeout_seconds: f64,
     /// Request deadline in seconds; `None` waits indefinitely.
     pub request_timeout_seconds: Option<f64>,
     /// Budget in seconds for the protocol `shutdown` request and each wait in
     /// the stdin-EOF → SIGTERM → SIGKILL ladder. Default `1.0`.
     pub shutdown_timeout_seconds: f64,
+    /// Handler for native `user-question/ask` requests; installing one
+    /// advertises `capabilities.userQuestions` at initialization.
+    pub on_user_question: Option<UserQuestionHandler>,
     /// PyPI-style index the downloader reads; default `https://pypi.org/pypi`.
     pub runtime_index_url: Option<String>,
     /// Runtime wheel version to download; default the crate version.
@@ -104,10 +322,15 @@ impl Default for HarnessClientOptions {
             args: Vec::new(),
             runtime_bin: None,
             launch_args_override: None,
+            profile: "sdk".to_string(),
+            patches: Vec::new(),
+            dsh_home: None,
             cwd: None,
             env: None,
+            initialize_timeout_seconds: 30.0,
             request_timeout_seconds: None,
             shutdown_timeout_seconds: 1.0,
+            on_user_question: None,
             runtime_index_url: None,
             runtime_version: None,
             runtime_cache_dir: None,
@@ -115,17 +338,22 @@ impl Default for HarnessClientOptions {
     }
 }
 
-/// The resolved launch channel plus the default `cordis.yml` when the
-/// downloader resolved the runtime.
+/// The resolved launch channel. `managed` launches receive `--profile`,
+/// `--patch`, and the required `DSH_HOME`; explicit channels are sent verbatim.
 struct ResolvedLaunch {
     command: String,
     args: Vec<String>,
-    default_config: Option<PathBuf>,
+    managed: bool,
 }
 
 struct ClientState {
     child: Arc<Mutex<Child>>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+struct QuestionTask {
+    cancellation: UserQuestionCancellation,
+    handle: tokio::task::JoinHandle<()>,
 }
 
 struct ClientInner {
@@ -135,6 +363,8 @@ struct ClientInner {
     parents: Arc<std::sync::Mutex<HashMap<String, String>>>,
     stderr_tail: Arc<std::sync::Mutex<VecDeque<String>>>,
     default_subscription: Mutex<Option<NotificationSubscription>>,
+    question_tasks: Arc<std::sync::Mutex<HashMap<String, QuestionTask>>>,
+    closing: AtomicBool,
 }
 
 /// The protocol client; clone to share one runtime subprocess.
@@ -158,6 +388,8 @@ impl HarnessClient {
                 parents: Arc::new(std::sync::Mutex::new(HashMap::new())),
                 stderr_tail: Arc::new(std::sync::Mutex::new(VecDeque::new())),
                 default_subscription: Mutex::new(None),
+                question_tasks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+                closing: AtomicBool::new(false),
             }),
         }
     }
@@ -165,9 +397,10 @@ impl HarnessClient {
     /// Spawn the runtime subprocess and attach the transport. Idempotent:
     /// a second call on a started client is a no-op.
     pub async fn start(&self) -> Result<(), SdkError> {
-        if self.inner.peer.initialized() {
+        if self.inner.peer.get().is_some() {
             return Ok(());
         }
+        self.inner.closing.store(false, Ordering::SeqCst);
         let resolved = self.resolve_launch()?;
         let env = self.build_env(&resolved)?;
 
@@ -192,7 +425,8 @@ impl HarnessClient {
         let peer = Peer::start(
             stdin,
             stdout,
-            Some(self.lineage_interceptor()),
+            Some(self.notification_interceptor()),
+            Some(Self::request_interceptor(&self.inner)),
             self.inner
                 .options
                 .request_timeout_seconds
@@ -218,13 +452,14 @@ impl HarnessClient {
                 }
                 tail.push_back(line);
             }
-            stderr_eof_task.notify_waiters();
+            stderr_eof_task.notify_one();
         });
 
         let child = Arc::new(Mutex::new(child));
         let monitor_peer = peer.clone();
         let monitor_child = child.clone();
         let monitor_tail = self.inner.stderr_tail.clone();
+        let monitor_questions = self.inner.question_tasks.clone();
         let monitor_task = tokio::spawn(async move {
             monitor_peer.wait_closed().await;
             // Give the stderr task a bounded moment to drain the last lines.
@@ -236,6 +471,9 @@ impl HarnessClient {
                 .ok()
                 .flatten()
                 .and_then(|status| status.code());
+            for task in monitor_questions.lock().unwrap().values() {
+                task.cancellation.cancel();
+            }
             let tail: Vec<String> = monitor_tail.lock().unwrap().iter().cloned().collect();
             monitor_peer.fail_closed(SdkError::transport_closed(
                 "DeepSeek Harness runtime stdout closed",
@@ -265,11 +503,32 @@ impl HarnessClient {
         );
         payload.insert("provider".to_string(), Value::from(params.provider.clone()));
         payload.insert("model".to_string(), Value::from(params.model.clone()));
+        if let Some(reasoning_effort) = &params.reasoning_effort {
+            payload.insert(
+                "reasoningEffort".to_string(),
+                Value::from(reasoning_effort.clone()),
+            );
+        }
         if let Some(max_tokens) = params.max_tokens {
             payload.insert("maxTokens".to_string(), Value::from(max_tokens));
         }
+        if params.approval_requests {
+            payload.insert("approvalRequests".to_string(), Value::Bool(true));
+        }
+        if self.inner.options.on_user_question.is_some() {
+            payload.insert(
+                "capabilities".to_string(),
+                serde_json::json!({"userQuestions": true}),
+            );
+        }
+        let timeout =
+            Duration::from_secs_f64(self.inner.options.initialize_timeout_seconds.max(0.0));
         match self
-            .request("initialize", Some(Value::Object(payload)))
+            .request_with_timeout(
+                "initialize",
+                Some(Value::Object(payload)),
+                Some(timeout.as_secs_f64()),
+            )
             .await
         {
             Ok(result) => {
@@ -284,7 +543,32 @@ impl HarnessClient {
             }
             Err(error) => {
                 self.close().await;
-                Err(error)
+                match error {
+                    SdkError::RequestTimeout { message } => Err(SdkError::RequestTimeout {
+                        message: format!(
+                            "{message}\nselected dsh profile {:?}",
+                            self.inner.options.profile
+                        ),
+                    }),
+                    SdkError::JsonRpcResponse {
+                        code,
+                        message,
+                        data,
+                    } => {
+                        let diagnostics = self.runtime_diagnostics().await;
+                        let message = if diagnostics.is_empty() {
+                            message
+                        } else {
+                            format!("{message}\n{diagnostics}")
+                        };
+                        Err(SdkError::JsonRpcResponse {
+                            code,
+                            message,
+                            data,
+                        })
+                    }
+                    other => Err(other),
+                }
             }
         }
     }
@@ -307,6 +591,66 @@ impl HarnessClient {
             })
     }
 
+    /// Restore a persisted session without enqueueing a prompt; missing,
+    /// unreadable, incompatible, or occupied sessions are rejected.
+    pub async fn resume_session(&self, session_id: &str) -> Result<(), SdkError> {
+        self.request(
+            "session/resume",
+            Some(serde_json::json!({"sessionId": session_id})),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Wait for an SDK-owned session and its managed descendants to settle.
+    pub async fn session_wait(&self, session_id: &str) -> Result<(), SdkError> {
+        self.request(
+            "session/wait",
+            Some(serde_json::json!({"sessionId": session_id})),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Read one session's effective working directory.
+    pub async fn get_working_directory(&self, session_id: &str) -> Result<String, SdkError> {
+        let result = self
+            .request(
+                "session/working-directory/get",
+                Some(serde_json::json!({"sessionId": session_id})),
+            )
+            .await?;
+        result
+            .get("cwd")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| {
+                SdkError::protocol("session/working-directory/get response requires a string cwd")
+            })
+    }
+
+    /// Change one session's effective working directory and return the
+    /// validated absolute path. Relative paths use the session's directory.
+    pub async fn set_working_directory(
+        &self,
+        session_id: &str,
+        path: &str,
+    ) -> Result<String, SdkError> {
+        let result = self
+            .request(
+                "session/working-directory/set",
+                Some(serde_json::json!({"sessionId": session_id, "path": path})),
+            )
+            .await?;
+        result
+            .get("cwd")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| {
+                SdkError::protocol("session/working-directory/set response requires a string cwd")
+            })
+    }
+
     /// Send one request frame and await its response, honoring the configured
     /// `request_timeout_seconds`. A timeout carries the runtime diagnostics
     /// (exit code and stderr tail when available), as in the Python SDK.
@@ -323,9 +667,7 @@ impl HarnessClient {
         params: Option<Value>,
         timeout_seconds: Option<f64>,
     ) -> Result<Value, SdkError> {
-        let peer = self.inner.peer.get().ok_or_else(|| {
-            SdkError::transport_closed("DeepSeek Harness runtime is not running", None, &[])
-        })?;
+        let peer = self.peer()?;
         let result = match timeout_seconds {
             None => peer.request(method, params).await,
             Some(seconds) => {
@@ -394,10 +736,7 @@ impl HarnessClient {
 
     /// Send one notification frame to the runtime.
     pub async fn notify(&self, method: &str, params: Option<Value>) -> Result<(), SdkError> {
-        let peer = self.inner.peer.get().ok_or_else(|| {
-            SdkError::transport_closed("DeepSeek Harness runtime is not running", None, &[])
-        })?;
-        peer.notify(method, params)
+        self.peer()?.notify(method, params)
     }
 
     /// Wait for the next notification that no subscriber matched.
@@ -410,19 +749,14 @@ impl HarnessClient {
     }
 
     /// Wait for the next server-to-client request queued by the runtime.
+    /// Requests handled by [`UserQuestionHandler`] never appear here.
     pub async fn next_request(&self) -> Result<IncomingRequest, SdkError> {
-        let peer = self.inner.peer.get().ok_or_else(|| {
-            SdkError::transport_closed("DeepSeek Harness runtime is not running", None, &[])
-        })?;
-        peer.next_request().await
+        self.peer()?.next_request().await
     }
 
     /// Answer a server-to-client request with a result frame.
     pub async fn respond(&self, id: &Value, result: Value) -> Result<(), SdkError> {
-        let peer = self.inner.peer.get().ok_or_else(|| {
-            SdkError::transport_closed("DeepSeek Harness runtime is not running", None, &[])
-        })?;
-        peer.respond(id, result)
+        self.peer()?.respond(id, result)
     }
 
     /// Answer a server-to-client request with an error frame; `data` rides
@@ -434,10 +768,7 @@ impl HarnessClient {
         message: &str,
         data: Option<Value>,
     ) -> Result<(), SdkError> {
-        let peer = self.inner.peer.get().ok_or_else(|| {
-            SdkError::transport_closed("DeepSeek Harness runtime is not running", None, &[])
-        })?;
-        peer.respond_error(id, code, message, data)
+        self.peer()?.respond_error(id, code, message, data)
     }
 
     /// Subscribe to notifications; `filter` narrows delivery.
@@ -445,10 +776,7 @@ impl HarnessClient {
         &self,
         filter: Option<NotificationFilter>,
     ) -> Result<NotificationSubscription, SdkError> {
-        let peer = self.inner.peer.get().ok_or_else(|| {
-            SdkError::transport_closed("DeepSeek Harness runtime is not running", None, &[])
-        })?;
-        Ok(peer.subscribe(filter))
+        Ok(self.peer()?.subscribe(filter))
     }
 
     /// Subscribe to one session plus every descendant discovered from
@@ -499,13 +827,29 @@ impl HarnessClient {
     /// Close the runtime: protocol `shutdown` → stdin EOF → SIGTERM →
     /// SIGKILL with bounded waits, then fail pending requests and
     /// subscriptions. Idempotent; a closed client rejects further use.
+    /// Outstanding user-question handlers receive cancellation first.
     pub async fn close(&self) {
+        let question_tasks: Vec<QuestionTask> = {
+            let mut tasks = self.inner.question_tasks.lock().unwrap();
+            // Publish `closing` under the same lock that guards task
+            // insertion, so a question cannot slip in after this drain.
+            self.inner.closing.store(true, Ordering::SeqCst);
+            tasks.drain().map(|(_, task)| task).collect()
+        };
+        for task in &question_tasks {
+            task.cancellation.cancel();
+        }
+
         let Some(state) = self.inner.state.lock().await.take() else {
+            Self::join_question_tasks(question_tasks).await;
             return;
         };
         let peer = match self.inner.peer.get() {
-            Some(peer) => peer,
-            None => return,
+            Some(peer) => peer.clone(),
+            None => {
+                Self::join_question_tasks(question_tasks).await;
+                return;
+            }
         };
         let timeout = Duration::from_secs_f64(self.inner.options.shutdown_timeout_seconds.max(0.0));
 
@@ -561,10 +905,28 @@ impl HarnessClient {
         for task in state.tasks {
             task.abort();
         }
+        Self::join_question_tasks(question_tasks).await;
+    }
+
+    /// Give cooperative handlers a shared 0.5-second window to observe
+    /// cancellation; callbacks that ignore it continue detached, as in the
+    /// Python SDK, but their late answers are suppressed.
+    async fn join_question_tasks(tasks: Vec<QuestionTask>) {
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+        for task in tasks {
+            let _ = tokio::time::timeout_at(deadline, task.handle).await;
+        }
+    }
+
+    fn peer(&self) -> Result<Peer, SdkError> {
+        self.inner.peer.get().cloned().ok_or_else(|| {
+            SdkError::transport_closed("DeepSeek Harness runtime is not running", None, &[])
+        })
     }
 
     /// Resolve the launch channel, most explicit wins: `launch_args_override`,
     /// `command`+`args`, `runtime_bin`, `$DSH_RUNTIME_BIN`, then the downloader.
+    /// Managed channels append `--profile` and ordered `--patch` arguments.
     fn resolve_launch(&self) -> Result<ResolvedLaunch, SdkError> {
         let options = &self.inner.options;
         if let Some(argv) = &options.launch_args_override {
@@ -575,31 +937,25 @@ impl HarnessClient {
             return Ok(ResolvedLaunch {
                 command: command.clone(),
                 args: argv.cloned().collect(),
-                default_config: None,
+                managed: false,
             });
         }
         if let Some(command) = &options.command {
             return Ok(ResolvedLaunch {
                 command: command.clone(),
                 args: options.args.clone(),
-                default_config: None,
+                managed: false,
             });
         }
         if let Some(bin) = &options.runtime_bin {
-            return Ok(ResolvedLaunch {
-                command: bin.to_string_lossy().into_owned(),
-                args: Vec::new(),
-                default_config: None,
-            });
+            let bin = crate::resolve_path(bin);
+            return self.managed_launch(bin.to_string_lossy().into_owned(), Vec::new());
         }
         if let Ok(bin) = std::env::var("DSH_RUNTIME_BIN")
             && !bin.is_empty()
         {
-            return Ok(ResolvedLaunch {
-                command: bin,
-                args: Vec::new(),
-                default_config: None,
-            });
+            let bin = crate::resolve_path(Path::new(&bin));
+            return self.managed_launch(bin.to_string_lossy().into_owned(), Vec::new());
         }
         #[cfg(feature = "runtime-download")]
         {
@@ -608,11 +964,11 @@ impl HarnessClient {
                 version: options.runtime_version.clone(),
                 cache_dir: options.runtime_cache_dir.clone(),
             })?;
-            Ok(ResolvedLaunch {
-                command: resolved.launch_args[0].clone(),
-                args: resolved.launch_args[1..].to_vec(),
-                default_config: Some(resolved.default_config),
-            })
+            let mut launch_args = resolved.launch_args.into_iter();
+            let command = launch_args.next().ok_or_else(|| SdkError::RuntimeResolve {
+                message: "the resolved runtime has an empty argv".into(),
+            })?;
+            self.managed_launch(command, launch_args.collect())
         }
         #[cfg(not(feature = "runtime-download"))]
         {
@@ -625,9 +981,31 @@ impl HarnessClient {
         }
     }
 
+    /// Add the profile selector and ordered patches to a managed launch.
+    fn managed_launch(
+        &self,
+        command: String,
+        mut args: Vec<String>,
+    ) -> Result<ResolvedLaunch, SdkError> {
+        args.push("--profile".to_string());
+        args.push(self.inner.options.profile.clone());
+        for patch in &self.inner.options.patches {
+            let resolved = crate::resolve_path(patch);
+            let path = resolved.to_str().ok_or_else(|| SdkError::Config {
+                message: format!("patch path is not valid UTF-8: {}", resolved.display()),
+            })?;
+            args.push("--patch".to_string());
+            args.push(path.to_string());
+        }
+        Ok(ResolvedLaunch {
+            command,
+            args,
+            managed: true,
+        })
+    }
+
     /// Assemble the child environment: the inherited environment overlaid
-    /// with `options.env`, then the default `cordis.yml` injected only when
-    /// the downloader resolved the runtime and no non-empty config exists.
+    /// with `options.env`, plus the required `DSH_HOME` for managed launches.
     fn build_env(
         &self,
         resolved: &ResolvedLaunch,
@@ -639,25 +1017,53 @@ impl HarnessClient {
                 env.insert(key.into(), value.into());
             }
         }
-        if let Some(config) = &resolved.default_config {
-            let has_config = env
-                .get(std::ffi::OsStr::new("DSH_CORDIS_CONFIG"))
-                .and_then(|value| value.to_str())
-                .is_some_and(|value| !value.is_empty());
-            if !has_config {
-                env.insert(
-                    "DSH_CORDIS_CONFIG".into(),
-                    config.to_string_lossy().into_owned().into(),
-                );
+        if resolved.managed {
+            match &self.inner.options.dsh_home {
+                Some(home) => {
+                    if home.as_os_str().is_empty() {
+                        return Err(SdkError::Config {
+                            message: "dsh_home must not be empty".into(),
+                        });
+                    }
+                    let home = crate::resolve_path(home);
+                    let home = home.to_str().ok_or_else(|| SdkError::Config {
+                        message: format!("dsh_home is not valid UTF-8: {}", home.display()),
+                    })?;
+                    env.insert("DSH_HOME".into(), home.into());
+                }
+                None => {
+                    let configured = env
+                        .get(std::ffi::OsStr::new("DSH_HOME"))
+                        .and_then(|value| value.to_str())
+                        .is_some_and(|value| !value.trim().is_empty());
+                    if !configured {
+                        return Err(SdkError::Config {
+                            message: "managed launches require an explicit dsh_home or a \
+                                      non-empty DSH_HOME; the Rust SDK never discovers ~/.dsh"
+                                .into(),
+                        });
+                    }
+                }
             }
         }
         Ok(env)
     }
 
-    /// The reader-task hook recording `subagent.started` lineage before fan-out.
-    fn lineage_interceptor(&self) -> Interceptor {
+    /// The reader-task hook recording `subagent.started` lineage and
+    /// cancelling a pending native question on `user-question.cancelled`.
+    fn notification_interceptor(&self) -> Interceptor {
         let parents = self.inner.parents.clone();
+        let question_tasks = self.inner.question_tasks.clone();
         Arc::new(move |notification| {
+            if notification.method == "user-question.cancelled"
+                && let Some(request_id) = notification
+                    .payload
+                    .get("requestId")
+                    .and_then(Value::as_str)
+                && let Some(task) = question_tasks.lock().unwrap().get(request_id)
+            {
+                task.cancellation.cancel();
+            }
             if notification.method != "subagent.started" {
                 return;
             }
@@ -680,5 +1086,133 @@ impl HarnessClient {
                     .insert(child.to_string(), parent.to_string());
             }
         })
+    }
+
+    /// The reader-task hook dispatching `user-question/ask` to a handler task.
+    fn request_interceptor(inner: &Arc<ClientInner>) -> RequestInterceptor {
+        let inner = Arc::downgrade(inner);
+        Arc::new(move |request: &IncomingRequest| {
+            let Some(inner) = inner.upgrade() else {
+                return false;
+            };
+            inner.dispatch_user_question(request)
+        })
+    }
+}
+
+impl ClientInner {
+    /// Dispatch one native question without blocking the reader. Returns
+    /// whether this hook owns the request. Invalid batches and duplicate
+    /// request ids receive `-32602`; handler failures receive `-32603`.
+    fn dispatch_user_question(&self, request: &IncomingRequest) -> bool {
+        if request.method != "user-question/ask" {
+            return false;
+        }
+        if self.closing.load(Ordering::SeqCst) {
+            // The runtime is going away; abandon the question without
+            // starting new handler work or answering a dying peer.
+            return true;
+        }
+        let Some(handler) = self.options.on_user_question.clone() else {
+            return false;
+        };
+        let Some(peer) = self.peer.get().cloned() else {
+            return false;
+        };
+        let question = match UserQuestionRequest::from_payload(&request.payload) {
+            Ok(question) => question,
+            Err(()) => {
+                let _ = peer.respond_error(
+                    &request.id,
+                    -32602,
+                    "invalid user-question/ask parameters",
+                    None,
+                );
+                return true;
+            }
+        };
+        let cancellation = UserQuestionCancellation::new();
+        let incoming_id = request.id.clone();
+        let request_id = question.request_id.clone();
+        let task_request_id = request_id.clone();
+        let task_question = question;
+        let task_cancellation = cancellation.clone();
+        let tasks = self.question_tasks.clone();
+        let task_peer = peer.clone();
+        let mut guard = self.question_tasks.lock().unwrap();
+        if self.closing.load(Ordering::SeqCst) {
+            return true;
+        }
+        if guard.contains_key(&request_id) {
+            drop(guard);
+            let _ = peer.respond_error(
+                &request.id,
+                -32602,
+                "duplicate user-question requestId",
+                None,
+            );
+            return true;
+        }
+        let handle = tokio::spawn(async move {
+            let mut handler_task =
+                tokio::spawn(handler.call(task_question, task_cancellation.clone()));
+            let outcome = tokio::select! {
+                outcome = &mut handler_task => Some(outcome),
+                _ = task_cancellation.cancelled() => None,
+            };
+            if let Some(outcome) = outcome
+                && !task_cancellation.is_cancelled()
+            {
+                match outcome {
+                    Ok(Ok(answer)) => match serde_json::to_value(&answer) {
+                        Ok(value) => {
+                            let _ = task_peer.respond(&incoming_id, value);
+                        }
+                        Err(error) => {
+                            let _ = task_peer.respond_error(
+                                &incoming_id,
+                                -32603,
+                                &format!("failed to encode user-question answer: {error}"),
+                                None,
+                            );
+                        }
+                    },
+                    Ok(Err(message)) => {
+                        let _ = task_peer.respond_error(&incoming_id, -32603, &message, None);
+                    }
+                    Err(error) if error.is_panic() => {
+                        let _ = task_peer.respond_error(
+                            &incoming_id,
+                            -32603,
+                            "user question handler panicked",
+                            None,
+                        );
+                    }
+                    Err(error) => {
+                        let _ = task_peer.respond_error(
+                            &incoming_id,
+                            -32603,
+                            &format!("user question handler failed: {error}"),
+                            None,
+                        );
+                    }
+                }
+            }
+            let mut guard = tasks.lock().unwrap();
+            if guard
+                .get(&task_request_id)
+                .is_some_and(|task| Arc::ptr_eq(&task.cancellation.inner, &task_cancellation.inner))
+            {
+                guard.remove(&task_request_id);
+            }
+        });
+        guard.insert(
+            request_id,
+            QuestionTask {
+                cancellation,
+                handle,
+            },
+        );
+        true
     }
 }

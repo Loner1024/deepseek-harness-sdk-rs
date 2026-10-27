@@ -6,9 +6,11 @@ use serde_json::Value;
 
 /// Errors surfaced by the SDK.
 ///
-/// The variants reproduce the Python SDK's taxonomy: [`JsonRpcResponse`]
-/// (`JsonRpcError`), [`RequestTimeout`] (`TimeoutError`), [`Protocol`]
-/// (`SdkProtocolError`), and [`TransportClosed`] (`TransportClosedError`).
+/// The variants reproduce the Python SDK's taxonomy: [`Self::JsonRpcResponse`]
+/// (`JsonRpcError`), [`Self::RequestTimeout`] (`TimeoutError`), [`Self::Protocol`]
+/// (`SdkProtocolError`), and [`Self::TransportClosed`] (`TransportClosedError`).
+/// [`Self::Io`], [`Self::RuntimeResolve`], [`Self::Config`], and
+/// [`Self::NestedRuntime`] are Rust-side extensions.
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum SdkError {
     /// The runtime answered a request with a JSON-RPC error response;
@@ -60,6 +62,13 @@ pub enum SdkError {
     #[error("{message}")]
     RuntimeResolve {
         /// Human-readable resolution failure report.
+        message: String,
+    },
+    /// The launch or SDK configuration is incomplete or invalid, such as a
+    /// missing `DSH_HOME` or a path that cannot be represented on the wire.
+    #[error("{message}")]
+    Config {
+        /// Human-readable configuration failure report.
         message: String,
     },
 }

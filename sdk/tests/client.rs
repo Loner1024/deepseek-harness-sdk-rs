@@ -4,9 +4,13 @@
 mod common;
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use deepseek_harness_sdk_rs::{HarnessClient, InitializeParams, SdkError};
+use deepseek_harness_sdk_rs::{
+    ApprovalOutcome, ApprovalRequestParams, ApprovalRequestResult, HarnessClient, InitializeParams,
+    SdkError, UserQuestionAnswer, UserQuestionAnswerItem, UserQuestionHandler, UserQuestionRequest,
+};
 use serde_json::json;
 
 fn initialize_params() -> InitializeParams {
@@ -14,8 +18,26 @@ fn initialize_params() -> InitializeParams {
         cwd: std::env::current_dir().expect("cwd"),
         provider: "test-provider".to_string(),
         model: "test-model".to_string(),
+        reasoning_effort: None,
         max_tokens: Some(100),
+        approval_requests: false,
     }
+}
+
+fn answer_handler(
+    answer: UserQuestionAnswer,
+) -> (
+    UserQuestionHandler,
+    Arc<std::sync::Mutex<Option<UserQuestionRequest>>>,
+) {
+    let seen = Arc::new(std::sync::Mutex::new(None));
+    let captured = seen.clone();
+    let handler = UserQuestionHandler::new(move |request, _cancellation| {
+        *captured.lock().unwrap() = Some(request);
+        let answer = answer.clone();
+        async move { Ok(answer) }
+    });
+    (handler, seen)
 }
 
 /// Await one notification or panic with the pending error after 5 seconds.
@@ -479,5 +501,465 @@ async fn notify_sends_a_client_notification() {
         .notify("ping", Some(json!({"n": 1})))
         .await
         .expect("notify");
+    client.close().await;
+}
+
+async fn notification_named(
+    client: &HarnessClient,
+    method: &str,
+) -> deepseek_harness_sdk_rs::Notification {
+    loop {
+        let notification = tokio::time::timeout(Duration::from_secs(5), client.next_notification())
+            .await
+            .expect("notification did not arrive in time")
+            .expect("next_notification failed");
+        if notification.method == method {
+            return notification;
+        }
+    }
+}
+
+#[tokio::test]
+async fn initialize_advertises_question_capability_and_approval_opt_in() {
+    let (handler, _seen) = answer_handler(UserQuestionAnswer { answers: vec![] });
+    let options = deepseek_harness_sdk_rs::HarnessClientOptions {
+        command: Some(common::fake_runtime()),
+        args: vec!["capability".to_string()],
+        on_user_question: Some(handler),
+        ..Default::default()
+    };
+    let client = HarnessClient::new(options);
+    client.start().await.expect("start");
+    let mut params = initialize_params();
+    params.reasoning_effort = Some("max".to_string());
+    params.approval_requests = true;
+    client.initialize(&params).await.expect("initialize");
+
+    let notification = notification_named(&client, "initialize-params").await;
+    assert_eq!(
+        notification
+            .payload
+            .get("capabilities")
+            .and_then(|value| value.get("userQuestions"))
+            .and_then(|value| value.as_bool()),
+        Some(true)
+    );
+    assert_eq!(
+        notification
+            .payload
+            .get("approvalRequests")
+            .and_then(|value| value.as_bool()),
+        Some(true)
+    );
+    assert_eq!(
+        notification
+            .payload
+            .get("reasoningEffort")
+            .and_then(|value| value.as_str()),
+        Some("max")
+    );
+    assert_eq!(
+        notification
+            .payload
+            .get("maxTokens")
+            .and_then(|value| value.as_u64()),
+        Some(100)
+    );
+    client.close().await;
+}
+
+#[tokio::test]
+async fn approval_request_round_trips_one_shot_decisions() {
+    let options = deepseek_harness_sdk_rs::HarnessClientOptions {
+        command: Some(common::fake_runtime()),
+        args: vec!["approval".to_string()],
+        ..Default::default()
+    };
+    let client = HarnessClient::new(options);
+    client.start().await.expect("start");
+    let mut params = initialize_params();
+    params.approval_requests = true;
+    client.initialize(&params).await.expect("initialize");
+
+    let notification = notification_named(&client, "initialize-params").await;
+    assert_eq!(
+        notification
+            .payload
+            .get("approvalRequests")
+            .and_then(|value| value.as_bool()),
+        Some(true)
+    );
+    let request = client.next_request().await.expect("approval request");
+    assert_eq!(request.method, "approval/request");
+    let approval: ApprovalRequestParams =
+        serde_json::from_value(request.payload.clone()).expect("approval params");
+    assert_eq!(approval.session_id, "main");
+    assert_eq!(approval.tool_name, "bash");
+    assert_eq!(approval.reason.as_deref(), Some("write"));
+    let decision = ApprovalRequestResult {
+        outcome: ApprovalOutcome::Rejected,
+    };
+    client
+        .respond(
+            &request.id,
+            serde_json::to_value(&decision).expect("decision"),
+        )
+        .await
+        .expect("respond");
+
+    let notification = notification_named(&client, "approval-decision").await;
+    assert_eq!(
+        notification.payload.get("result"),
+        Some(&json!({"outcome": "rejected"}))
+    );
+    client.close().await;
+}
+
+#[tokio::test]
+async fn user_question_handler_answers_and_preserves_metadata() {
+    let answer = UserQuestionAnswer {
+        answers: vec![UserQuestionAnswerItem {
+            id: "format".to_string(),
+            selected: vec!["CSV".to_string()],
+            custom: None,
+        }],
+    };
+    let (handler, seen) = answer_handler(answer);
+    let options = deepseek_harness_sdk_rs::HarnessClientOptions {
+        command: Some(common::fake_runtime()),
+        args: vec!["user-question".to_string()],
+        on_user_question: Some(handler),
+        ..Default::default()
+    };
+    let client = HarnessClient::new(options);
+    client.start().await.expect("start");
+    client
+        .initialize(&initialize_params())
+        .await
+        .expect("initialize");
+    client
+        .session_prompt("s1", &[json!({"type": "text", "text": "hi"})])
+        .await
+        .expect("session_prompt");
+
+    let question = seen.lock().unwrap().clone().expect("handler ran");
+    assert_eq!(question.request_id, "ask-1");
+    assert_eq!(question.session_id, "s1");
+    assert_eq!(question.questions.len(), 1);
+    assert_eq!(
+        question.questions[0]
+            .get("detail")
+            .and_then(|value| value.as_str()),
+        Some("Plan to review")
+    );
+    assert_eq!(
+        question.questions[0].get("intent"),
+        Some(&json!({"kind": "plan-review", "approve": "CSV"}))
+    );
+
+    let notification = notification_named(&client, "question-answer").await;
+    assert_eq!(
+        notification.payload.get("result"),
+        Some(&json!({"answers": [{"id": "format", "selected": ["CSV"]}]}))
+    );
+    assert_eq!(notification.payload.get("error"), Some(&json!(null)));
+    client.close().await;
+}
+
+#[tokio::test]
+async fn user_question_handler_failure_becomes_a_protocol_error() {
+    let options = deepseek_harness_sdk_rs::HarnessClientOptions {
+        command: Some(common::fake_runtime()),
+        args: vec!["user-question".to_string()],
+        on_user_question: Some(UserQuestionHandler::new(|_request, _cancellation| async {
+            Err("answer service unavailable".to_string())
+        })),
+        ..Default::default()
+    };
+    let client = HarnessClient::new(options);
+    client.start().await.expect("start");
+    client
+        .initialize(&initialize_params())
+        .await
+        .expect("initialize");
+    client
+        .session_prompt("s1", &[json!({"type": "text", "text": "hi"})])
+        .await
+        .expect("session_prompt");
+
+    let notification = notification_named(&client, "question-answer").await;
+    assert_eq!(
+        notification.payload.get("error"),
+        Some(&json!({"code": -32603, "message": "answer service unavailable"}))
+    );
+    client.close().await;
+}
+
+#[tokio::test]
+async fn user_question_cancellation_reaches_the_handler() {
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let observed = cancelled.clone();
+    let options = deepseek_harness_sdk_rs::HarnessClientOptions {
+        command: Some(common::fake_runtime()),
+        args: vec!["user-question-cancel".to_string()],
+        on_user_question: Some(UserQuestionHandler::new(move |_request, cancellation| {
+            let observed = observed.clone();
+            async move {
+                cancellation.cancelled().await;
+                observed.store(true, Ordering::SeqCst);
+                Ok(UserQuestionAnswer {
+                    answers: vec![UserQuestionAnswerItem {
+                        id: "format".to_string(),
+                        selected: vec!["late".to_string()],
+                        custom: None,
+                    }],
+                })
+            }
+        })),
+        ..Default::default()
+    };
+    let client = HarnessClient::new(options);
+    client.start().await.expect("start");
+    client
+        .initialize(&initialize_params())
+        .await
+        .expect("initialize");
+    client
+        .session_prompt("s1", &[json!({"type": "text", "text": "hi"})])
+        .await
+        .expect("session_prompt");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !cancelled.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        cancelled.load(Ordering::SeqCst),
+        "the handler must observe cancellation"
+    );
+    client.close().await;
+}
+
+#[tokio::test]
+async fn invalid_user_question_receives_invalid_params() {
+    let called = Arc::new(AtomicBool::new(false));
+    let observed = called.clone();
+    let options = deepseek_harness_sdk_rs::HarnessClientOptions {
+        command: Some(common::fake_runtime()),
+        args: vec!["user-question-invalid".to_string()],
+        on_user_question: Some(UserQuestionHandler::new(move |_request, _cancellation| {
+            observed.store(true, Ordering::SeqCst);
+            async { Ok(UserQuestionAnswer { answers: vec![] }) }
+        })),
+        ..Default::default()
+    };
+    let client = HarnessClient::new(options);
+    client.start().await.expect("start");
+    client
+        .initialize(&initialize_params())
+        .await
+        .expect("initialize");
+
+    let notification = notification_named(&client, "question-invalid").await;
+    assert_eq!(notification.payload.get("ok"), Some(&json!(true)));
+    assert!(
+        !called.load(Ordering::SeqCst),
+        "an invalid batch must not reach the handler"
+    );
+    client.close().await;
+}
+
+#[tokio::test]
+async fn initialize_timeout_names_the_selected_profile() {
+    let mut options = common::client_options("slow-initialize");
+    options.initialize_timeout_seconds = 0.1;
+    options.env = Some(
+        [("DSH_FAKE_DELAY_SECONDS".to_string(), "2".to_string())]
+            .into_iter()
+            .collect(),
+    );
+    let client = HarnessClient::new(options);
+    client.start().await.expect("start");
+    let error = client.initialize(&initialize_params()).await.unwrap_err();
+    match error {
+        SdkError::RequestTimeout { message } => {
+            assert!(
+                message.contains("selected dsh profile"),
+                "message: {message}"
+            );
+            assert!(message.contains("sdk"), "message: {message}");
+        }
+        other => panic!("expected RequestTimeout, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn missing_dsh_home_is_a_config_error() {
+    let options = deepseek_harness_sdk_rs::HarnessClientOptions {
+        runtime_bin: Some(std::path::PathBuf::from(common::fake_runtime())),
+        env: Some(
+            [("DSH_HOME".to_string(), String::new())]
+                .into_iter()
+                .collect(),
+        ),
+        ..Default::default()
+    };
+    let client = HarnessClient::new(options);
+    let error = client.start().await.unwrap_err();
+    assert!(
+        matches!(error, SdkError::Config { .. }),
+        "expected Config, got {error:?}"
+    );
+}
+
+#[tokio::test]
+async fn managed_launch_sets_home_profile_and_patches() {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    let first = temp.path().join("first.yml");
+    let second = temp.path().join("second.yml");
+    std::fs::write(&first, b"").expect("first patch");
+    std::fs::write(&second, b"").expect("second patch");
+    std::fs::create_dir_all(temp.path().join("home")).expect("home");
+    let options = deepseek_harness_sdk_rs::HarnessClientOptions {
+        runtime_bin: Some(std::path::PathBuf::from(common::fake_runtime())),
+        profile: "custom".to_string(),
+        patches: vec![first.clone(), second.clone()],
+        dsh_home: Some(temp.path().join("home")),
+        env: Some(
+            [
+                ("DSH_FAKE_SCENARIO".to_string(), "launch".to_string()),
+                ("DSH_CORDIS_CONFIG".to_string(), String::new()),
+                ("DSH_CWD".to_string(), String::new()),
+            ]
+            .into_iter()
+            .collect(),
+        ),
+        ..Default::default()
+    };
+    let client = HarnessClient::new(options);
+    client.start().await.expect("start");
+    client
+        .initialize(&initialize_params())
+        .await
+        .expect("initialize");
+    let report = client
+        .initialize(&initialize_params())
+        .await
+        .expect("second initialize reports launch");
+    let report: serde_json::Value = serde_json::from_str(
+        report
+            .server_info
+            .expect("serverInfo")
+            .version
+            .expect("version")
+            .as_str(),
+    )
+    .expect("launch report");
+
+    let canonical = |path: &std::path::Path| {
+        path.canonicalize()
+            .unwrap_or_else(|_| path.to_path_buf())
+            .to_string_lossy()
+            .into_owned()
+    };
+    assert_eq!(
+        report.get("args"),
+        Some(&json!([
+            "--profile",
+            "custom",
+            "--patch",
+            canonical(&first),
+            "--patch",
+            canonical(&second)
+        ]))
+    );
+    assert_eq!(
+        report.get("dsh_home").and_then(|value| value.as_str()),
+        Some(canonical(&temp.path().join("home")).as_str())
+    );
+    assert_eq!(report.get("cordis"), Some(&json!(null)));
+    client.close().await;
+}
+
+#[tokio::test]
+async fn explicit_launch_sends_argv_verbatim() {
+    let options = deepseek_harness_sdk_rs::HarnessClientOptions {
+        launch_args_override: Some(vec![common::fake_runtime(), "launch".to_string()]),
+        env: Some(
+            [("DSH_CORDIS_CONFIG".to_string(), String::new())]
+                .into_iter()
+                .collect(),
+        ),
+        ..Default::default()
+    };
+    let client = HarnessClient::new(options);
+    client.start().await.expect("start");
+    client
+        .initialize(&initialize_params())
+        .await
+        .expect("initialize");
+    let report = client
+        .initialize(&initialize_params())
+        .await
+        .expect("second initialize reports launch");
+    let report: serde_json::Value = serde_json::from_str(
+        report
+            .server_info
+            .expect("serverInfo")
+            .version
+            .expect("version")
+            .as_str(),
+    )
+    .expect("launch report");
+    assert_eq!(report.get("args"), Some(&json!(["launch"])));
+    assert_eq!(report.get("dsh_home"), Some(&json!(null)));
+    assert_eq!(report.get("cordis"), Some(&json!(null)));
+    client.close().await;
+}
+
+#[tokio::test]
+async fn session_helpers_round_trip() {
+    let client = HarnessClient::new(common::client_options("session"));
+    client.start().await.expect("start");
+    client
+        .initialize(&initialize_params())
+        .await
+        .expect("initialize");
+    client.resume_session("saved").await.expect("resume");
+    client.session_wait("saved").await.expect("wait");
+    assert_eq!(
+        client
+            .get_working_directory("saved")
+            .await
+            .expect("get working directory"),
+        "/fake/saved"
+    );
+    assert_eq!(
+        client
+            .set_working_directory("saved", "/tmp/work")
+            .await
+            .expect("set working directory"),
+        "/tmp/work"
+    );
+    client.close().await;
+}
+
+#[tokio::test]
+async fn initialize_without_a_handler_does_not_advertise_questions() {
+    let client = HarnessClient::new(common::client_options("capability"));
+    client.start().await.expect("start");
+    client
+        .initialize(&initialize_params())
+        .await
+        .expect("initialize");
+    let notification = notification_named(&client, "initialize-params").await;
+    assert!(
+        notification.payload.get("capabilities").is_none(),
+        "no handler must mean no user-question capability"
+    );
+    assert!(
+        notification.payload.get("approvalRequests").is_none(),
+        "approval requests stay opt-in"
+    );
     client.close().await;
 }

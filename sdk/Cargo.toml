@@ -1,6 +1,6 @@
 [package]
 name = "deepseek-harness-sdk-rs"
-description = "Rust SDK for DeepSeek Harness: drive the harness JSON-RPC runtime as a subprocess"
+description = "Rust SDK for DeepSeek Harness: drive the dsh JSON-RPC runtime as a subprocess"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

@@ -4,26 +4,33 @@
 //! blocking facade ([`DeepSeekHarnessSync`]).
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::client::{HarnessClient, HarnessClientOptions, InitializeParams, Notification};
+use crate::client::{
+    HarnessClient, HarnessClientOptions, InitializeParams, Notification, UserQuestionHandler,
+};
 use crate::error::SdkError;
 
 /// Configuration for launching the local DeepSeek Harness SDK runtime.
 ///
 /// The runtime inherits the caller's environment by default, so existing
 /// `DEEPSEEK_API_KEY` and `DEEPSEEK_BASE_URL` settings keep working; `env`
-/// entries overlay it for the subprocess.
+/// entries overlay it for the subprocess. Managed launches require an explicit
+/// Harness home through `dsh_home` or a non-empty `DSH_HOME`; the SDK never
+/// discovers `~/.dsh` implicitly. Explicit `launch_args_override` callers own
+/// their argv and environment.
 #[derive(Clone, Debug)]
 pub struct DeepSeekHarnessConfig {
     /// Provider route for the `initialize` handshake. Default `deepseek-official`.
     pub provider: String,
     /// Model name for the `initialize` handshake. Default `deepseek-v4-flash`.
     pub model: String,
+    /// Optional adapter-owned reasoning effort for the selected route.
+    pub reasoning_effort: Option<String>,
     /// Optional positive output-token cap inherited by SDK-created agents.
     pub max_tokens: Option<u64>,
     /// Workspace directory recorded on every SDK-created session; resolved to
@@ -32,16 +39,24 @@ pub struct DeepSeekHarnessConfig {
     /// Working directory of the spawned runtime; resolved the same way.
     /// Default the workspace `cwd`.
     pub runtime_cwd: Option<PathBuf>,
-    /// Persistent session root; sets `DSH_SESSION_ROOT` when given.
-    pub session_root: Option<PathBuf>,
-    /// Explicit runtime `cordis.yml`; sets `DSH_CORDIS_CONFIG` when given.
-    pub cordis: Option<PathBuf>,
+    /// Explicit Harness home; sets `DSH_HOME`. Managed launches require it
+    /// unless the child environment already provides a non-empty `DSH_HOME`.
+    pub dsh_home: Option<PathBuf>,
+    /// Harness profile to boot. Default `sdk`.
+    pub profile: String,
+    /// Ordered profile patches, applied after the profile layer.
+    pub patches: Vec<PathBuf>,
     /// Extra environment entries for the runtime subprocess.
     pub env: HashMap<String, String>,
-    /// Explicit path of the single-file runtime executable.
+    /// Explicit path of the packaged `dsh` executable. The SDK appends the
+    /// profile and patch arguments.
     pub runtime_bin: Option<PathBuf>,
-    /// Explicit argv tuple; wins over every other launch channel.
+    /// Explicit argv tuple; wins over every other launch channel, is sent
+    /// verbatim without profile or patch arguments, and skips the managed
+    /// `DSH_HOME` requirement.
     pub launch_args_override: Option<Vec<String>>,
+    /// Bound in seconds on the initial `initialize` handshake. Default `30.0`.
+    pub initialize_timeout_seconds: f64,
     /// Request deadline in seconds; `None` waits indefinitely.
     pub request_timeout_seconds: Option<f64>,
     /// Budget in seconds for the protocol `shutdown` request and each wait in
@@ -51,6 +66,13 @@ pub struct DeepSeekHarnessConfig {
     pub base_url: Option<String>,
     /// Provider API key; sets `DEEPSEEK_API_KEY` when given.
     pub api_key: Option<String>,
+    /// Handler for native `user-question/ask` requests; installing one
+    /// advertises `capabilities.userQuestions` at initialization.
+    pub on_user_question: Option<UserQuestionHandler>,
+    /// Opt in to server-to-client `approval/request` calls. When enabled,
+    /// drain [`HarnessClient::next_request`] concurrently with a run and
+    /// answer through [`HarnessClient::respond`].
+    pub approval_requests: bool,
     /// PyPI-style index the downloader reads; default `https://pypi.org/pypi`.
     pub runtime_index_url: Option<String>,
     /// Runtime wheel version to download; default the crate version.
@@ -64,18 +86,23 @@ impl Default for DeepSeekHarnessConfig {
         Self {
             provider: "deepseek-official".to_string(),
             model: "deepseek-v4-flash".to_string(),
+            reasoning_effort: None,
             max_tokens: None,
             cwd: None,
             runtime_cwd: None,
-            session_root: None,
-            cordis: None,
+            dsh_home: None,
+            profile: "sdk".to_string(),
+            patches: Vec::new(),
             env: HashMap::new(),
             runtime_bin: None,
             launch_args_override: None,
+            initialize_timeout_seconds: 30.0,
             request_timeout_seconds: None,
             shutdown_timeout_seconds: 1.0,
             base_url: None,
             api_key: None,
+            on_user_question: None,
+            approval_requests: false,
             runtime_index_url: None,
             runtime_version: None,
             runtime_cache_dir: None,
@@ -105,8 +132,6 @@ pub struct RunResult {
     pub events: Vec<Value>,
     /// All collected notifications, in protocol order.
     pub notifications: Vec<Notification>,
-    /// The configured persistent session root, if any.
-    pub session_root: Option<PathBuf>,
 }
 
 /// Prompt input: plain text becomes one text content block; a block list is
@@ -155,8 +180,9 @@ struct HarnessInner {
 }
 
 /// Reusable harness: the runtime subprocess starts lazily on the first
-/// [`run`](Self::run) and stays owned by this instance across calls. Drop the
-/// instance to release it; the client's shutdown ladder reaps the subprocess.
+/// [`run`](Self::run) and stays owned by this instance across calls. Call
+/// [`close`](Self::close) when finished; if the last handle is dropped
+/// without closing, `kill_on_drop` terminates the child.
 #[derive(Clone)]
 pub struct DeepSeekHarness {
     inner: Arc<HarnessInner>,
@@ -183,19 +209,6 @@ impl DeepSeekHarness {
             .map(crate::resolve_path)
             .unwrap_or_else(|| cwd.clone());
         let mut env = config.env.clone();
-        if let Some(root) = &config.session_root {
-            env.insert(
-                "DSH_SESSION_ROOT".to_string(),
-                root.to_string_lossy().into_owned(),
-            );
-        }
-        if let Some(cordis) = &config.cordis {
-            env.insert(
-                "DSH_CORDIS_CONFIG".to_string(),
-                cordis.to_string_lossy().into_owned(),
-            );
-        }
-        env.insert("DSH_CWD".to_string(), cwd.to_string_lossy().into_owned());
         if let Some(base_url) = &config.base_url {
             env.insert("DEEPSEEK_BASE_URL".to_string(), base_url.clone());
         }
@@ -205,10 +218,15 @@ impl DeepSeekHarness {
         let client = HarnessClient::new(HarnessClientOptions {
             runtime_bin: config.runtime_bin.clone(),
             launch_args_override: config.launch_args_override.clone(),
+            profile: config.profile.clone(),
+            patches: config.patches.clone(),
+            dsh_home: config.dsh_home.clone(),
             cwd: Some(runtime_cwd),
             env: Some(env),
+            initialize_timeout_seconds: config.initialize_timeout_seconds,
             request_timeout_seconds: config.request_timeout_seconds,
             shutdown_timeout_seconds: config.shutdown_timeout_seconds,
+            on_user_question: config.on_user_question.clone(),
             runtime_index_url: config.runtime_index_url.clone(),
             runtime_version: config.runtime_version.clone(),
             runtime_cache_dir: config.runtime_cache_dir.clone(),
@@ -236,7 +254,9 @@ impl DeepSeekHarness {
                 cwd: self.inner.cwd.clone(),
                 provider: self.inner.config.provider.clone(),
                 model: self.inner.config.model.clone(),
+                reasoning_effort: self.inner.config.reasoning_effort.clone(),
                 max_tokens: self.inner.config.max_tokens,
+                approval_requests: self.inner.config.approval_requests,
             })
             .await?;
         *self.inner.initialized.lock().unwrap() = true;
@@ -259,6 +279,18 @@ impl DeepSeekHarness {
         Ok(Session {
             harness: self.clone(),
             id,
+        })
+    }
+
+    /// Restore a persisted session from the configured Harness home without
+    /// sending input, and return a handle ready for [`Session::run`]. Missing,
+    /// unreadable, incompatible, or occupied sessions are rejected.
+    pub async fn resume_session(&self, session_id: &str) -> Result<Session, SdkError> {
+        self.start().await?;
+        self.inner.client.resume_session(session_id).await?;
+        Ok(Session {
+            harness: self.clone(),
+            id: session_id.to_string(),
         })
     }
 
@@ -330,7 +362,6 @@ impl DeepSeekHarness {
             finish_reason: crate::events::finish_reason(&events)?,
             events,
             notifications,
-            session_root: self.inner.config.session_root.clone(),
         })
     }
 
@@ -374,6 +405,34 @@ impl Session {
             )
             .await
     }
+
+    /// Read the effective working directory, recovering a missing directory
+    /// to the session origin.
+    pub async fn get_working_directory(&self) -> Result<String, SdkError> {
+        self.harness.start().await?;
+        self.harness
+            .inner
+            .client
+            .get_working_directory(&self.id)
+            .await
+    }
+
+    /// Change the effective working directory while existing processes keep
+    /// their own directories; returns the validated absolute path.
+    pub async fn set_working_directory(&self, path: impl AsRef<Path>) -> Result<String, SdkError> {
+        let path = path.as_ref().to_str().ok_or_else(|| SdkError::Config {
+            message: format!(
+                "working directory is not valid UTF-8: {}",
+                path.as_ref().display()
+            ),
+        })?;
+        self.harness.start().await?;
+        self.harness
+            .inner
+            .client
+            .set_working_directory(&self.id, path)
+            .await
+    }
 }
 
 /// Blocking facade over [`DeepSeekHarness`]: one current-thread tokio runtime
@@ -413,6 +472,13 @@ impl DeepSeekHarnessSync {
         self.guard()?;
         self.runtime()
             .block_on(self.harness.start_session(session_id))
+    }
+
+    /// Restore a persisted session and return a handle ready to run.
+    pub fn resume_session(&self, session_id: &str) -> Result<Session, SdkError> {
+        self.guard()?;
+        self.runtime()
+            .block_on(self.harness.resume_session(session_id))
     }
 
     /// Run one turn and block until the interval settles.

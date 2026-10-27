@@ -25,13 +25,35 @@ pub fn client_options(scenario: &str) -> HarnessClientOptions {
     }
 }
 
-/// The runtime exe name (without directory) for the current platform, plus
-/// whether the wheel must carry the macOS spawn helper.
-pub fn platform_exe() -> (String, bool) {
+/// The runtime exe name (without directory) and its ripgrep sidecar for the
+/// current platform, plus whether the wheel must carry the macOS spawn helper.
+pub fn platform_exe() -> (String, String, bool) {
     match (std::env::consts::OS, std::env::consts::ARCH) {
-        ("macos", "aarch64") => ("dsh-jsonrpc-agent-pkg-macos-arm64".to_string(), true),
-        ("linux", "x86_64") => ("dsh-jsonrpc-agent-pkg-linux-x64".to_string(), false),
-        ("linux", "aarch64") => ("dsh-jsonrpc-agent-pkg-linux-arm64".to_string(), false),
+        ("macos", "aarch64") => (
+            "deepseek-harness-sdk-runtime-macos-arm64".to_string(),
+            "deepseek-harness-sdk-runtime-macos-arm64-rg".to_string(),
+            true,
+        ),
+        ("macos", "x86_64") => (
+            "deepseek-harness-sdk-runtime-macos-x64".to_string(),
+            "deepseek-harness-sdk-runtime-macos-x64-rg".to_string(),
+            true,
+        ),
+        ("linux", "x86_64") => (
+            "deepseek-harness-sdk-runtime-linux-x64".to_string(),
+            "deepseek-harness-sdk-runtime-linux-x64-rg".to_string(),
+            false,
+        ),
+        ("linux", "aarch64") => (
+            "deepseek-harness-sdk-runtime-linux-arm64".to_string(),
+            "deepseek-harness-sdk-runtime-linux-arm64-rg".to_string(),
+            false,
+        ),
+        ("windows", "x86_64") => (
+            "deepseek-harness-sdk-runtime-win-x64.exe".to_string(),
+            "deepseek-harness-sdk-runtime-win-x64-rg.exe".to_string(),
+            false,
+        ),
         (os, arch) => panic!("no downloader fixture wheel for os={os} arch={arch}"),
     }
 }
@@ -40,8 +62,22 @@ pub fn platform_exe() -> (String, bool) {
 pub fn platform_tag() -> &'static str {
     match (std::env::consts::OS, std::env::consts::ARCH) {
         ("macos", "aarch64") => "py3-none-macosx_14_0_arm64",
+        ("macos", "x86_64") => "py3-none-macosx_14_0_x86_64",
         ("linux", "x86_64") => "py3-none-manylinux_2_28_x86_64",
         ("linux", "aarch64") => "py3-none-manylinux_2_28_aarch64",
+        ("windows", "x86_64") => "py3-none-win_amd64",
+        (os, arch) => panic!("no downloader fixture wheel for os={os} arch={arch}"),
+    }
+}
+
+/// The platform resource directory inside the runtime wheel.
+pub fn platform_dir() -> &'static str {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos", "aarch64") => "macos-arm64",
+        ("macos", "x86_64") => "macos-x64",
+        ("linux", "x86_64") => "linux-x64",
+        ("linux", "aarch64") => "linux-arm64",
+        ("windows", "x86_64") => "win-x64",
         (os, arch) => panic!("no downloader fixture wheel for os={os} arch={arch}"),
     }
 }

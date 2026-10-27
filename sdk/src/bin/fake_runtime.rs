@@ -10,14 +10,24 @@
 //! - `echo` — respond to every request with its params.
 //! - `slow` — write a stderr marker, then sleep `$DSH_FAKE_DELAY_SECONDS`
 //!   (default 2) before answering `session/prompt` and other requests.
+//! - `slow-initialize` — sleep `$DSH_FAKE_DELAY_SECONDS` (default 2) before
+//!   answering `initialize`.
 //! - `error` — answer `session/prompt` with a JSON-RPC error carrying data.
 //! - `reject-prompt` — answer `session/prompt` with `{"accepted": false}`.
 //! - `cwd` — report wire cwd, process cwd, and `$DSH_CWD` via `serverInfo.version`.
+//! - `launch` — report argv, `$DSH_HOME`, cwd, and `$DSH_CORDIS_CONFIG`.
+//! - `capability` — echo the `initialize` params in an `initialize-params` notification.
 //! - `crash` — write stderr lines and exit 7 right after `initialize`.
 //! - `no-shutdown` — never exit on `shutdown`; waits to be killed.
 //! - `request-to-client` — send a server-to-client request; expect a result frame `{"ok": true}`.
 //! - `request-to-client-error` — send a request; expect an error frame with code 99.
 //! - `request-then-exit` — send a request, then exit 2 without waiting.
+//! - `approval` — send `approval/request`; expect `{"outcome":"rejected"}`.
+//! - `user-question` — send `user-question/ask` during a prompt and report the answer.
+//! - `user-question-cancel` — send `user-question/ask`, cancel it, then finish the prompt.
+//! - `user-question-invalid` — send an invalid question batch and expect `-32602`.
+//! - `session` — implement `session/resume`, `session/wait`, and the
+//!   working-directory methods with deterministic values.
 //! - `subagent` — emit subagent lifecycle around a child session, then idle.
 //! - `invalid-lines` — emit garbage lines, then one valid notification.
 //! - `invalid-id-notification` — emit a notification frame carrying a null id.
@@ -33,9 +43,21 @@ use serde_json::{Value, json};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
-    let scenario = std::env::args()
-        .nth(1)
-        .filter(|arg| !arg.starts_with("--"))
+    let mut args = std::env::args().skip(1);
+    let mut scenario = None;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--profile" | "--patch" => {
+                let _ = args.next();
+            }
+            flag if flag.starts_with("--") => {}
+            other => {
+                scenario = Some(other.to_string());
+                break;
+            }
+        }
+    }
+    let scenario = scenario
         .or_else(|| std::env::var("DSH_FAKE_SCENARIO").ok())
         .unwrap_or_else(|| "basic".to_string());
 
@@ -82,11 +104,23 @@ async fn main() {
 
         match method {
             "initialize" => {
+                if scenario == "slow-initialize" {
+                    eprintln!("fake runtime slow initialize coming");
+                    tokio::time::sleep(tokio::time::Duration::from_secs_f64(delay_seconds(2.0)))
+                        .await;
+                }
+                let params_owned = params.cloned().unwrap_or(Value::Null);
                 let server_info = match scenario.as_str() {
-                    "env" => {
-                        let config = std::env::var("DSH_CORDIS_CONFIG")
-                            .unwrap_or_else(|_| "unset".to_string());
-                        json!({"serverInfo": {"name": "deepseek-harness-sdk-runtime", "version": config}})
+                    "launch" => {
+                        let report = json!({
+                            "args": std::env::args().skip(1).collect::<Vec<String>>(),
+                            "dsh_home": std::env::var("DSH_HOME").ok().filter(|value| !value.is_empty()),
+                            "cwd": std::env::current_dir()
+                                .ok()
+                                .map(|path| Value::from(path.to_string_lossy().into_owned())),
+                            "cordis": std::env::var("DSH_CORDIS_CONFIG").ok().filter(|value| !value.is_empty()),
+                        });
+                        json!({"serverInfo": {"name": "deepseek-harness-sdk-runtime", "version": report.to_string()}})
                     }
                     "cwd" => {
                         let report = json!({
@@ -94,7 +128,7 @@ async fn main() {
                             "process": std::env::current_dir()
                                 .ok()
                                 .map(|path| Value::from(path.to_string_lossy().into_owned())),
-                            "env": std::env::var("DSH_CWD").ok(),
+                            "env": std::env::var("DSH_CWD").ok().filter(|value| !value.is_empty()),
                         });
                         json!({"serverInfo": {"name": "deepseek-harness-sdk-runtime", "version": report.to_string()}})
                     }
@@ -104,6 +138,60 @@ async fn main() {
                 };
                 respond(&mut stdout, &id, server_info);
                 match scenario.as_str() {
+                    "capability" => {
+                        notify(&mut stdout, "initialize-params", &params_owned);
+                    }
+                    "approval" => {
+                        notify(&mut stdout, "initialize-params", &params_owned);
+                        write_line(
+                            &mut stdout,
+                            &json!({
+                                "jsonrpc": "2.0",
+                                "id": "approval-1",
+                                "method": "approval/request",
+                                "params": {"sessionId": "main", "toolName": "bash", "reason": "write"}
+                            }),
+                        );
+                        let mut response = String::new();
+                        if stdin.read_line(&mut response).is_ok() {
+                            let answer: Value =
+                                serde_json::from_str(&response).unwrap_or(Value::Null);
+                            notify(
+                                &mut stdout,
+                                "approval-decision",
+                                &json!({
+                                    "result": answer.get("result"),
+                                    "error": answer.get("error"),
+                                }),
+                            );
+                        }
+                    }
+                    "user-question-invalid" => {
+                        write_line(
+                            &mut stdout,
+                            &json!({
+                                "jsonrpc": "2.0",
+                                "id": "invalid-q",
+                                "method": "user-question/ask",
+                                "params": {"sessionId": "s", "questions": []}
+                            }),
+                        );
+                        let mut response = String::new();
+                        if stdin.read_line(&mut response).is_ok() {
+                            let answer: Value =
+                                serde_json::from_str(&response).unwrap_or(Value::Null);
+                            let ok = answer
+                                .get("error")
+                                .and_then(|error| error.get("code"))
+                                .and_then(Value::as_i64)
+                                == Some(-32602);
+                            notify(
+                                &mut stdout,
+                                "question-invalid",
+                                &json!({"ok": ok, "response": answer}),
+                            );
+                        }
+                    }
                     "crash" => {
                         eprintln!("fake runtime stderr line one");
                         eprintln!("fake runtime stderr line two");
@@ -183,10 +271,7 @@ async fn main() {
                     "echo" => respond(&mut stdout, &id, params.cloned().unwrap_or(Value::Null)),
                     "slow" => {
                         eprintln!("fake runtime slow response coming");
-                        let seconds = std::env::var("DSH_FAKE_DELAY_SECONDS")
-                            .ok()
-                            .and_then(|v| v.parse::<f64>().ok())
-                            .unwrap_or(2.0);
+                        let seconds = delay_seconds(2.0);
                         tokio::time::sleep(tokio::time::Duration::from_secs_f64(seconds)).await;
                         respond(&mut stdout, &id, json!({"messageId": "msg-slow"}));
                     }
@@ -198,6 +283,98 @@ async fn main() {
                         &id,
                         json!({"code": -32603, "message": "boom", "data": {"detail": "fake runtime refused"}}),
                     ),
+                    "user-question" => {
+                        let message_id = uuid::Uuid::new_v4().simple().to_string();
+                        notify(
+                            &mut stdout,
+                            "session.event",
+                            &json!({"sessionId": session_id, "event": {"type": "agent/inbox/spliced", "data": {"inserted": [{"id": message_id}]}}}),
+                        );
+                        write_line(
+                            &mut stdout,
+                            &json!({
+                                "jsonrpc": "2.0",
+                                "id": "q-1",
+                                "method": "user-question/ask",
+                                "params": {
+                                    "requestId": "ask-1",
+                                    "sessionId": session_id,
+                                    "questions": [{
+                                        "id": "format",
+                                        "question": "Which format?",
+                                        "detail": "Plan to review",
+                                        "options": [{"label": "CSV"}],
+                                        "intent": {"kind": "plan-review", "approve": "CSV"}
+                                    }]
+                                }
+                            }),
+                        );
+                        let mut response = String::new();
+                        let answer: Value = if stdin.read_line(&mut response).is_ok() {
+                            serde_json::from_str(&response).unwrap_or(Value::Null)
+                        } else {
+                            Value::Null
+                        };
+                        notify(
+                            &mut stdout,
+                            "question-answer",
+                            &json!({"result": answer.get("result"), "error": answer.get("error")}),
+                        );
+                        notify(
+                            &mut stdout,
+                            "session.event",
+                            &json!({"sessionId": session_id, "event": {"type": "assistant/message", "data": {"message": {"content": [{"type": "text", "text": "hello from fake"}]}}}}),
+                        );
+                        notify(
+                            &mut stdout,
+                            "session.event",
+                            &json!({"sessionId": session_id, "event": {"type": "turn/end", "data": {"reason": {"kind": "max-tokens"}}}}),
+                        );
+                        notify(
+                            &mut stdout,
+                            "session.status",
+                            &json!({"sessionId": session_id, "status": "idle"}),
+                        );
+                        respond(&mut stdout, &id, json!({"messageId": message_id}));
+                    }
+                    "user-question-cancel" => {
+                        let message_id = uuid::Uuid::new_v4().simple().to_string();
+                        notify(
+                            &mut stdout,
+                            "session.event",
+                            &json!({"sessionId": session_id, "event": {"type": "agent/inbox/spliced", "data": {"inserted": [{"id": message_id}]}}}),
+                        );
+                        write_line(
+                            &mut stdout,
+                            &json!({
+                                "jsonrpc": "2.0",
+                                "id": "q-1",
+                                "method": "user-question/ask",
+                                "params": {
+                                    "requestId": "ask-1",
+                                    "sessionId": session_id,
+                                    "questions": [{"id": "format", "question": "Which format?"}]
+                                }
+                            }),
+                        );
+                        notify(
+                            &mut stdout,
+                            "user-question.cancelled",
+                            &json!({"requestId": "ask-1", "sessionId": session_id}),
+                        );
+                        notify(&mut stdout, "question-cancel-sent", &json!({}));
+                        notify(
+                            &mut stdout,
+                            "session.event",
+                            &json!({"sessionId": session_id, "event": {"type": "turn/end", "data": {"reason": {"kind": "cancelled"}}}}),
+                        );
+                        notify(
+                            &mut stdout,
+                            "session.status",
+                            &json!({"sessionId": session_id, "status": "idle"}),
+                        );
+                        respond(&mut stdout, &id, json!({"messageId": message_id}));
+                    }
                     "subagent" => {
                         let message_id = uuid::Uuid::new_v4().simple().to_string();
                         let child = format!("session-child-{}", uuid::Uuid::new_v4().simple());
@@ -320,6 +497,27 @@ async fn main() {
                     }
                 }
             }
+            "session/resume" | "session/wait" => {
+                respond(&mut stdout, &id, json!({}));
+            }
+            "session/working-directory/get" => {
+                let session_id = params
+                    .and_then(|p| p.get("sessionId"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("s");
+                respond(
+                    &mut stdout,
+                    &id,
+                    json!({"cwd": format!("/fake/{session_id}")}),
+                );
+            }
+            "session/working-directory/set" => {
+                let path = params
+                    .and_then(|p| p.get("path"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("/fake");
+                respond(&mut stdout, &id, json!({"cwd": path}));
+            }
             "shutdown" => {
                 if scenario == "no-shutdown" {
                     eprintln!("fake runtime got shutdown but refuses to exit");
@@ -335,10 +533,7 @@ async fn main() {
             _ => match scenario.as_str() {
                 "echo" => respond(&mut stdout, &id, params.cloned().unwrap_or(Value::Null)),
                 "slow" => {
-                    let seconds = std::env::var("DSH_FAKE_DELAY_SECONDS")
-                        .ok()
-                        .and_then(|v| v.parse::<f64>().ok())
-                        .unwrap_or(2.0);
+                    let seconds = delay_seconds(2.0);
                     tokio::time::sleep(tokio::time::Duration::from_secs_f64(seconds)).await;
                     respond(&mut stdout, &id, params.cloned().unwrap_or(Value::Null));
                 }
@@ -378,4 +573,11 @@ fn notify(stdout: &mut BufWriter<std::io::Stdout>, method: &str, payload: &Value
         stdout,
         &json!({"jsonrpc": "2.0", "method": method, "params": payload}),
     );
+}
+
+fn delay_seconds(default: f64) -> f64 {
+    std::env::var("DSH_FAKE_DELAY_SECONDS")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .unwrap_or(default)
 }

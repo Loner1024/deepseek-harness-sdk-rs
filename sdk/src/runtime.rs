@@ -1,7 +1,7 @@
 //! Runtime acquisition: the feature-gated downloader that fetches the
 //! platform runtime wheel from a PyPI-style index, verifies its SHA-256
-//! digest, and extracts the executable (plus the macOS spawn helper and the
-//! default `cordis.yml`) into a versioned cache.
+//! digest, and extracts the packaged `dsh` executable, its sidecars, and the
+//! platform resource directory into a versioned cache.
 //!
 //! The build workflow retains platform wheels and nothing else, so PyPI is
 //! the only published artifact stream carrying the runtime executable today.
@@ -24,17 +24,22 @@ pub struct ResolveOptions {
     pub cache_dir: Option<PathBuf>,
 }
 
-/// The resolved runtime executable plus its default configuration.
+/// The resolved runtime executable.
 #[derive(Debug)]
 pub struct ResolvedRuntime {
-    /// argv tuple launching the runtime.
+    /// argv tuple launching the executable; the client appends `--profile`
+    /// and patch arguments.
     pub launch_args: Vec<String>,
-    /// The extracted default `cordis.yml`.
-    pub default_config: PathBuf,
+}
+
+/// Wheel tag and packaged executable name for the current target.
+struct Platform {
+    wheel_tag: &'static str,
+    exe_name: &'static str,
 }
 
 /// Normalize a semver pre-release to PEP 440 spelling for PyPI queries:
-/// cargo spells `0.1.0-rc.6` while the wheel index spells `0.1.0rc6`.
+/// cargo spells `0.2.1-rc.2` while the wheel index spells `0.2.1rc2`.
 fn to_pypi_version(version: &str) -> String {
     for (from, to) in [("-rc.", "rc"), ("-beta.", "b"), ("-alpha.", "a")] {
         if let Some(pos) = version.find(from) {
@@ -46,26 +51,59 @@ fn to_pypi_version(version: &str) -> String {
     version.to_string()
 }
 
-/// Wheel tag and executable suffix for the current target.
-fn platform() -> Result<(&'static str, &'static str), SdkError> {
+fn platform() -> Result<Platform, SdkError> {
     match (std::env::consts::OS, std::env::consts::ARCH) {
-        ("macos", "aarch64") => Ok(("py3-none-macosx_14_0_arm64", "macos-arm64")),
-        ("linux", "x86_64") => Ok(("py3-none-manylinux_2_28_x86_64", "linux-x64")),
-        ("linux", "aarch64") => Ok(("py3-none-manylinux_2_28_aarch64", "linux-arm64")),
+        ("macos", "aarch64") => Ok(Platform {
+            wheel_tag: "py3-none-macosx_14_0_arm64",
+            exe_name: "deepseek-harness-sdk-runtime-macos-arm64",
+        }),
+        ("macos", "x86_64") => Ok(Platform {
+            wheel_tag: "py3-none-macosx_14_0_x86_64",
+            exe_name: "deepseek-harness-sdk-runtime-macos-x64",
+        }),
+        ("linux", "x86_64") => Ok(Platform {
+            wheel_tag: "py3-none-manylinux_2_28_x86_64",
+            exe_name: "deepseek-harness-sdk-runtime-linux-x64",
+        }),
+        ("linux", "aarch64") => Ok(Platform {
+            wheel_tag: "py3-none-manylinux_2_28_aarch64",
+            exe_name: "deepseek-harness-sdk-runtime-linux-arm64",
+        }),
+        ("windows", "x86_64") => Ok(Platform {
+            wheel_tag: "py3-none-win_amd64",
+            exe_name: "deepseek-harness-sdk-runtime-win-x64.exe",
+        }),
         (os, arch) => Err(SdkError::RuntimeResolve {
             message: format!(
                 "no deepseek-harness-runtime-bin wheel exists for this platform \
-                 (os={os}, arch={arch}); supported: macos/arm64, linux/x64, linux/arm64. \
-                 Provide HarnessClientOptions.runtime_bin instead."
+                 (os={os}, arch={arch}); supported: macos/arm64, macos/x64, linux/x64, \
+                 linux/arm64, windows/x64. Provide an explicit runtime executable instead."
             ),
         }),
     }
 }
 
+/// The ripgrep sidecar shipped next to the executable on every platform.
+fn sidecar_name(exe_name: &str) -> String {
+    match exe_name.strip_suffix(".exe") {
+        Some(stem) => format!("{stem}-rg.exe"),
+        None => format!("{exe_name}-rg"),
+    }
+}
+
+/// macOS ships a native PTY spawn helper beside the executable.
+fn spawn_helper_name(exe_name: &str) -> String {
+    format!("{exe_name}-spawn-helper")
+}
+
+fn is_macos(exe_name: &str) -> bool {
+    exe_name.starts_with("deepseek-harness-sdk-runtime-macos-")
+}
+
 /// Resolve the platform runtime: reuse a verified cache entry or fetch,
 /// verify, and extract the platform wheel.
 pub fn resolve(options: &ResolveOptions) -> Result<ResolvedRuntime, SdkError> {
-    let (wheel_tag, exe_tag) = platform()?;
+    let platform = platform()?;
     let version = to_pypi_version(
         &options
             .version
@@ -91,24 +129,20 @@ pub fn resolve(options: &ResolveOptions) -> Result<ResolvedRuntime, SdkError> {
                 .into(),
         })?;
     let cache_dir = cache_root.join(&version);
-    let exe_name = format!("dsh-jsonrpc-agent-pkg-{exe_tag}");
-    let exe_path = cache_dir.join(&exe_name);
-    let config_path = cache_dir.join("cordis.yml");
+    let exe_path = cache_dir.join(platform.exe_name);
 
-    if cache_valid(&cache_dir, &exe_path, &exe_name) {
+    if cache_valid(&cache_dir, &platform) {
         return Ok(ResolvedRuntime {
             launch_args: vec![exe_path.to_string_lossy().into_owned()],
-            default_config: config_path,
         });
     }
 
-    let file = fetch_wheel(index, &version, wheel_tag)?;
+    let file = fetch_wheel(index, &version, platform.wheel_tag)?;
     let bytes = download(&file.url)?;
     verify_digest(&bytes, &file.sha256)?;
-    extract(&cache_dir, &exe_name, &bytes)?;
+    extract(&cache_dir, &platform, &bytes)?;
     Ok(ResolvedRuntime {
         launch_args: vec![exe_path.to_string_lossy().into_owned()],
-        default_config: config_path,
     })
 }
 
@@ -171,17 +205,18 @@ fn fetch_wheel(index: &str, version: &str, wheel_tag: &str) -> Result<WheelFile,
     Err(SdkError::RuntimeResolve {
         message: format!(
             "deepseek-harness-runtime-bin {version} has no wheel for platform tag {wheel_tag}; \
-             provide HarnessClientOptions.runtime_bin instead"
+             provide an explicit runtime executable instead"
         ),
     })
 }
 
-/// Ceiling on the in-memory wheel download; the current wheel is ~174 MB, so
+/// Ceiling on the in-memory wheel download; the current wheel is ~90 MB, so
 /// the bound leaves headroom while keeping ureq's 10 MB default off the path.
 const RUNTIME_WHEEL_MAX_BYTES: u64 = 512 * 1024 * 1024;
 
-/// Download the wheel into memory; the exe is ~174 MB, so this is the only
-/// large allocation in the module and is never cached in that form.
+/// Download the wheel into memory; the embedded executable is ~300 MB, so
+/// this is the only large allocation in the module and is never cached in
+/// that form.
 fn download(url: &str) -> Result<Vec<u8>, SdkError> {
     let mut response = ureq::get(url)
         .call()
@@ -213,17 +248,21 @@ fn verify_digest(bytes: &[u8], expected_hex: &str) -> Result<(), SdkError> {
     Ok(())
 }
 
-/// Extract the executable, the macOS spawn helper where applicable, and the
-/// default `cordis.yml` into the cache directory; the `.complete` marker is
-/// written last so an interrupted extraction never reads as a valid cache.
-fn extract(cache_dir: &Path, exe_name: &str, bytes: &[u8]) -> Result<(), SdkError> {
+/// Wheel-relative directory holding the executable and its runtime payload.
+const RUNTIME_PREFIX: &str = "deepseek_harness_runtime/runtime/";
+
+/// Extract the executable, sidecars, and platform resources into the cache
+/// directory; the `.complete` marker is written last so an interrupted
+/// extraction never reads as a valid cache.
+fn extract(cache_dir: &Path, platform: &Platform, bytes: &[u8]) -> Result<(), SdkError> {
     let staging = cache_dir.with_file_name(format!(
-        "{}.tmp-{}",
+        "{}.tmp-{}-{}",
         cache_dir
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("stage"),
-        std::process::id()
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
     ));
     if staging.exists() {
         let _ = std::fs::remove_dir_all(&staging);
@@ -238,21 +277,86 @@ fn extract(cache_dir: &Path, exe_name: &str, bytes: &[u8]) -> Result<(), SdkErro
             zip::ZipArchive::new(Cursor::new(bytes)).map_err(|error| SdkError::RuntimeResolve {
                 message: format!("runtime wheel is not a readable zip: {error}"),
             })?;
-        let exe_entry = format!("deepseek_harness_runtime/runtime/{exe_name}");
-        write_entry(&mut archive, &exe_entry, &staging.join(exe_name))?;
-        if exe_name.starts_with("macos-") {
-            let helper_entry = format!("deepseek_harness_runtime/runtime/{exe_name}-spawn-helper");
-            write_entry(
-                &mut archive,
-                &helper_entry,
-                &staging.join(format!("{exe_name}-spawn-helper")),
-            )?;
+        for index in 0..archive.len() {
+            let mut entry = archive
+                .by_index(index)
+                .map_err(|error| SdkError::RuntimeResolve {
+                    message: format!("runtime wheel entry {index} is unreadable: {error}"),
+                })?;
+            let Some(path) = entry.enclosed_name() else {
+                continue;
+            };
+            let Ok(relative) = path.strip_prefix(RUNTIME_PREFIX) else {
+                continue;
+            };
+            if relative.as_os_str().is_empty() || relative.starts_with("node") {
+                // Skip the directory itself and the repo-only Node carrier.
+                continue;
+            }
+            let dest = staging.join(relative);
+            if entry.is_dir() {
+                std::fs::create_dir_all(&dest)?;
+                continue;
+            }
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let mode = entry.unix_mode();
+            let mut out = std::fs::File::create(&dest)?;
+            std::io::copy(&mut entry, &mut out)?;
+            drop(out);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = mode.map(|mode| mode & 0o777).unwrap_or(0o644);
+                let mode = if mode & 0o111 != 0 { mode } else { 0o644 };
+                std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(mode))?;
+            }
+            #[cfg(not(unix))]
+            let _ = mode;
         }
-        write_entry(
-            &mut archive,
-            "deepseek_harness_runtime/runtime/cordis.yml",
-            &staging.join("cordis.yml"),
-        )?;
+
+        let exe_path = staging.join(platform.exe_name);
+        if !exe_path.is_file() {
+            return Err(SdkError::RuntimeResolve {
+                message: format!(
+                    "runtime wheel is missing deepseek_harness_runtime/runtime/{}",
+                    platform.exe_name
+                ),
+            });
+        }
+        let sidecar = staging.join(sidecar_name(platform.exe_name));
+        if !sidecar.is_file() {
+            return Err(SdkError::RuntimeResolve {
+                message: format!(
+                    "runtime wheel is missing the ripgrep sidecar {}",
+                    sidecar_name(platform.exe_name)
+                ),
+            });
+        }
+        if is_macos(platform.exe_name)
+            && !staging.join(spawn_helper_name(platform.exe_name)).is_file()
+        {
+            return Err(SdkError::RuntimeResolve {
+                message: format!(
+                    "runtime wheel is missing the macOS spawn helper {}",
+                    spawn_helper_name(platform.exe_name)
+                ),
+            });
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for path in [
+                &exe_path,
+                &sidecar,
+                &staging.join(spawn_helper_name(platform.exe_name)),
+            ] {
+                if path.is_file() {
+                    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))?;
+                }
+            }
+        }
         std::fs::write(staging.join(".complete"), b"")?;
         if cache_dir.exists() {
             let _ = std::fs::remove_dir_all(cache_dir);
@@ -270,38 +374,22 @@ fn extract(cache_dir: &Path, exe_name: &str, bytes: &[u8]) -> Result<(), SdkErro
     result
 }
 
-fn write_entry(
-    archive: &mut zip::ZipArchive<Cursor<&[u8]>>,
-    entry: &str,
-    dest: &Path,
-) -> Result<(), SdkError> {
-    let mut file = archive
-        .by_name(entry)
-        .map_err(|error| SdkError::RuntimeResolve {
-            message: format!("runtime wheel is missing {entry}: {error}"),
-        })?;
-    let mut out = std::fs::File::create(dest)?;
-    std::io::copy(&mut file, &mut out)?;
-    drop(out);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(dest, std::fs::Permissions::from_mode(0o755))?;
-    }
-    Ok(())
-}
-
-/// A cache entry is valid when the marker, the executable, and (on macOS)
-/// the spawn helper all exist.
-fn cache_valid(cache_dir: &Path, exe_path: &Path, exe_name: &str) -> bool {
-    if !cache_dir.join(".complete").is_file() || !exe_path.is_file() {
+/// A cache entry is valid when the marker, the executable, its ripgrep
+/// sidecar, and (on macOS) the spawn helper all exist.
+fn cache_valid(cache_dir: &Path, platform: &Platform) -> bool {
+    let exe = cache_dir.join(platform.exe_name);
+    if !cache_dir.join(".complete").is_file() || !exe.is_file() {
         return false;
     }
-    if exe_name.starts_with("macos-") {
-        let helper = exe_path.with_file_name(format!("{exe_name}-spawn-helper"));
-        if !helper.is_file() {
-            return false;
-        }
+    if !cache_dir.join(sidecar_name(platform.exe_name)).is_file() {
+        return false;
+    }
+    if is_macos(platform.exe_name)
+        && !cache_dir
+            .join(spawn_helper_name(platform.exe_name))
+            .is_file()
+    {
+        return false;
     }
     true
 }
@@ -313,6 +401,7 @@ mod tests {
     #[test]
     fn normalizes_pre_release_spelling() {
         assert_eq!(to_pypi_version("0.1.0-rc.6"), "0.1.0rc6");
+        assert_eq!(to_pypi_version("0.2.1-rc.2"), "0.2.1rc2");
         assert_eq!(to_pypi_version("0.2.0-beta.1"), "0.2.0b1");
         assert_eq!(to_pypi_version("0.3.0-alpha.3"), "0.3.0a3");
     }

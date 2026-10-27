@@ -1,11 +1,9 @@
 //! Keyless smoke against the real runtime executable: one turn through a
-//! scripted SSE model server.
+//! scripted Messages model server.
 //!
-//! Self-skips with an explanation when `DSH_TEST_RUNTIME_EXE` or
-//! `DSH_TEST_CORDIS_CONFIG` is unset; the Rust SDK CI smoke job provides both
-//! from a built runtime wheel. Run locally after
-//! `scripts/build-exe-for-python-sdk.ts` by exporting the built exe and the
-//! checked-in default `cordis.yml`.
+//! Self-skips with an explanation when `DSH_TEST_RUNTIME_EXE` is unset; the
+//! Rust SDK CI smoke job resolves that executable (and its sidecars) through
+//! the downloader.
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -13,7 +11,6 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use deepseek_harness_sdk_rs::{DeepSeekHarness, DeepSeekHarnessConfig, RunOptions};
-use serde_json::json;
 
 const EXPECTED: &str = "rust sdk smoke ok";
 
@@ -23,22 +20,24 @@ fn env(name: &str) -> Option<String> {
 
 #[tokio::test]
 async fn real_runtime_completes_one_turn_through_a_scripted_model() {
-    let (Some(exe), Some(cordis)) = (env("DSH_TEST_RUNTIME_EXE"), env("DSH_TEST_CORDIS_CONFIG"))
-    else {
+    let Some(exe) = env("DSH_TEST_RUNTIME_EXE") else {
         eprintln!(
-            "SKIP: DSH_TEST_RUNTIME_EXE and DSH_TEST_CORDIS_CONFIG are unset; the CI smoke job provides both"
+            "SKIP: DSH_TEST_RUNTIME_EXE is unset; the CI smoke job resolves the runtime wheel"
         );
         return;
     };
-    let session_root = tempfile::TempDir::new().expect("tempdir");
+    let home = tempfile::TempDir::new().expect("tempdir");
     let base = start_mock_server();
 
     let harness = DeepSeekHarness::new(DeepSeekHarnessConfig {
         runtime_bin: Some(PathBuf::from(&exe)),
-        cordis: Some(PathBuf::from(&cordis)),
+        dsh_home: Some(home.path().to_path_buf()),
         base_url: Some(format!("http://{base}/v1")),
         api_key: Some("smoke-key".to_string()),
-        session_root: Some(session_root.path().to_path_buf()),
+        max_tokens: Some(4_096),
+        env: [("DSH_TELEMETRY_DISABLED".to_string(), "1".to_string())]
+            .into_iter()
+            .collect(),
         ..Default::default()
     });
     let result = tokio::time::timeout(
@@ -51,16 +50,67 @@ async fn real_runtime_completes_one_turn_through_a_scripted_model() {
     assert_eq!(result.final_response, EXPECTED);
     harness.close().await;
 
-    // The default composition persists the session log under
-    // DSH_SESSION_ROOT; the file may be plain JSONL or zstd-compressed
-    // depending on the persistence configuration.
+    // The selected profile persists the session log under DSH_HOME; the file
+    // may be plain JSONL or zstd-compressed depending on the release.
     assert!(
-        contains_session_log(session_root.path()),
-        "session root must contain a session log"
+        contains_session_log(home.path()),
+        "the harness home must contain a session log"
     );
 }
 
-/// A session log exists under `dir`: any `session.jsonl` file, optionally
+#[tokio::test]
+async fn real_runtime_resumes_a_persisted_session() {
+    let Some(exe) = env("DSH_TEST_RUNTIME_EXE") else {
+        eprintln!(
+            "SKIP: DSH_TEST_RUNTIME_EXE is unset; the CI smoke job resolves the runtime wheel"
+        );
+        return;
+    };
+    let home = tempfile::TempDir::new().expect("tempdir");
+    let base = start_mock_server();
+    let config = || DeepSeekHarnessConfig {
+        runtime_bin: Some(PathBuf::from(&exe)),
+        dsh_home: Some(home.path().to_path_buf()),
+        base_url: Some(format!("http://{base}/v1")),
+        api_key: Some("smoke-key".to_string()),
+        max_tokens: Some(4_096),
+        env: [("DSH_TELEMETRY_DISABLED".to_string(), "1".to_string())]
+            .into_iter()
+            .collect(),
+        ..Default::default()
+    };
+
+    let first = DeepSeekHarness::new(config());
+    let result = tokio::time::timeout(
+        Duration::from_secs(180),
+        first.run("start a persisted session", &RunOptions::default()),
+    )
+    .await
+    .expect("first turn timed out")
+    .expect("first turn failed");
+    first.close().await;
+
+    let second = DeepSeekHarness::new(config());
+    let session = tokio::time::timeout(
+        Duration::from_secs(180),
+        second.resume_session(&result.session_id),
+    )
+    .await
+    .expect("resume timed out")
+    .expect("resume failed");
+    assert_eq!(session.id(), result.session_id);
+    let resumed = tokio::time::timeout(
+        Duration::from_secs(180),
+        session.run("continue the task", None),
+    )
+    .await
+    .expect("resumed turn timed out")
+    .expect("resumed turn failed");
+    assert_eq!(resumed.final_response, EXPECTED);
+    second.close().await;
+}
+
+/// A session log exists under `dir`: any `session.*.jsonl` file, optionally
 /// zstd-compressed, at any depth.
 fn contains_session_log(dir: &std::path::Path) -> bool {
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -77,7 +127,7 @@ fn contains_session_log(dir: &std::path::Path) -> bool {
         if path
             .file_name()
             .and_then(|name| name.to_str())
-            .is_some_and(|name| name.starts_with("session.jsonl"))
+            .is_some_and(|name| name.starts_with("session.") && name.contains(".jsonl"))
         {
             return true;
         }
@@ -86,8 +136,7 @@ fn contains_session_log(dir: &std::path::Path) -> bool {
 }
 
 /// A minimal scripted model: every completion request gets the fixed text
-/// completion streamed as OpenAI-style SSE, mirroring the chunk sequence of
-/// the Python runtime smoke's scripted model.
+/// completion streamed as a DeepSeek Messages event stream.
 fn start_mock_server() -> String {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let port = listener.local_addr().expect("addr").port();
@@ -98,10 +147,37 @@ fn start_mock_server() -> String {
                 continue;
             }
             let payload = format!(
-                "data: {}\n\ndata: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
-                json!({"choices": [{"delta": {"role": "assistant", "content": null, "reasoning_content": ""}}]}),
-                json!({"choices": [{"delta": {"content": EXPECTED}}]}),
-                json!({"choices": [{"delta": {"content": ""}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 3, "completion_tokens": 3}}),
+                "event: message_start\ndata: {}\n\n\
+                 event: content_block_start\ndata: {}\n\n\
+                 event: content_block_delta\ndata: {}\n\n\
+                 event: content_block_stop\ndata: {}\n\n\
+                 event: message_delta\ndata: {}\n\n\
+                 event: message_stop\ndata: {}\n\n",
+                serde_json::json!({
+                    "type": "message_start",
+                    "message": {
+                        "id": "smoke-response",
+                        "model": "deepseek-v4-flash",
+                        "usage": {"input_tokens": 3, "output_tokens": 0}
+                    }
+                }),
+                serde_json::json!({
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {"type": "text", "text": ""}
+                }),
+                serde_json::json!({
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "text_delta", "text": EXPECTED}
+                }),
+                serde_json::json!({"type": "content_block_stop", "index": 0}),
+                serde_json::json!({
+                    "type": "message_delta",
+                    "delta": {"stop_reason": "end_turn"},
+                    "usage": {"output_tokens": 3}
+                }),
+                serde_json::json!({"type": "message_stop"}),
             );
             let _ = write!(
                 stream,
