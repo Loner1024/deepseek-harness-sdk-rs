@@ -58,7 +58,7 @@ pub fn platform_exe() -> (String, String, bool) {
     }
 }
 
-/// The PyPI platform tag matching [`platform_exe`].
+/// The `PyPI` platform tag matching [`platform_exe`].
 pub fn platform_tag() -> &'static str {
     match (std::env::consts::OS, std::env::consts::ARCH) {
         ("macos", "aarch64") => "py3-none-macosx_14_0_arm64",

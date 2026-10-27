@@ -15,7 +15,7 @@ use crate::client::{
 };
 use crate::error::SdkError;
 
-/// Configuration for launching the local DeepSeek Harness SDK runtime.
+/// Configuration for launching the local `DeepSeek` Harness SDK runtime.
 ///
 /// The runtime inherits the caller's environment by default, so existing
 /// `DEEPSEEK_API_KEY` and `DEEPSEEK_BASE_URL` settings keep working; `env`
@@ -194,20 +194,17 @@ impl DeepSeekHarness {
         // Python's `Path.resolve()` semantics: absolute and symlink-resolved,
         // with any not-yet-existing tail preserved. Applied before environment
         // injection and the wire handshake, and again at subprocess launch.
-        let cwd = config
-            .cwd
-            .as_deref()
-            .map(crate::resolve_path)
-            .unwrap_or_else(|| {
+        let cwd = config.cwd.as_deref().map_or_else(
+            || {
                 std::env::current_dir()
-                    .map(|path| crate::resolve_path(&path))
-                    .unwrap_or_else(|_| PathBuf::from("."))
-            });
+                    .map_or_else(|_| PathBuf::from("."), |path| crate::resolve_path(&path))
+            },
+            crate::resolve_path,
+        );
         let runtime_cwd = config
             .runtime_cwd
             .as_deref()
-            .map(crate::resolve_path)
-            .unwrap_or_else(|| cwd.clone());
+            .map_or_else(|| cwd.clone(), crate::resolve_path);
         let mut env = config.env.clone();
         if let Some(base_url) = &config.base_url {
             env.insert("DEEPSEEK_BASE_URL".to_string(), base_url.clone());
@@ -366,11 +363,13 @@ impl DeepSeekHarness {
     }
 
     /// The underlying protocol client, for callers that need the low-level surface.
+    #[must_use]
     pub fn client(&self) -> &HarnessClient {
         &self.inner.client
     }
 
     /// The configuration this harness was built with.
+    #[must_use]
     pub fn config(&self) -> &DeepSeekHarnessConfig {
         &self.inner.config
     }
@@ -385,6 +384,7 @@ pub struct Session {
 
 impl Session {
     /// The session id prompts run on.
+    #[must_use]
     pub fn id(&self) -> &str {
         &self.id
     }
@@ -463,20 +463,20 @@ impl DeepSeekHarnessSync {
 
     /// Start the runtime and perform the `initialize` handshake.
     pub fn start(&self) -> Result<(), SdkError> {
-        self.guard()?;
+        Self::guard()?;
         self.runtime().block_on(self.harness.start())
     }
 
     /// Open a named session handle, or a fresh session when `session_id` is `None`.
     pub fn start_session(&self, session_id: Option<&str>) -> Result<Session, SdkError> {
-        self.guard()?;
+        Self::guard()?;
         self.runtime()
             .block_on(self.harness.start_session(session_id))
     }
 
     /// Restore a persisted session and return a handle ready to run.
     pub fn resume_session(&self, session_id: &str) -> Result<Session, SdkError> {
-        self.guard()?;
+        Self::guard()?;
         self.runtime()
             .block_on(self.harness.resume_session(session_id))
     }
@@ -487,13 +487,13 @@ impl DeepSeekHarnessSync {
         input: impl Into<Input>,
         options: &RunOptions<'_>,
     ) -> Result<RunResult, SdkError> {
-        self.guard()?;
+        Self::guard()?;
         self.runtime().block_on(self.harness.run(input, options))
     }
 
     /// Close the runtime with the shutdown ladder.
     pub fn close(&self) -> Result<(), SdkError> {
-        self.guard()?;
+        Self::guard()?;
         self.runtime().block_on(self.harness.close());
         Ok(())
     }
@@ -503,7 +503,7 @@ impl DeepSeekHarnessSync {
         &self.harness
     }
 
-    fn guard(&self) -> Result<(), SdkError> {
+    fn guard() -> Result<(), SdkError> {
         if tokio::runtime::Handle::try_current().is_ok() {
             return Err(SdkError::NestedRuntime);
         }

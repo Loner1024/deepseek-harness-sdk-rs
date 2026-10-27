@@ -78,4 +78,4 @@ cargo run --example deep_research -- "self-hosted vector databases"
 
 ## 贡献者工作流
 
-用 `cargo fmt --all`、`cargo clippy --all-targets --features test-support -- -D warnings` 与 `cargo test --features test-support` 构建和测试；`test-support` feature 构建机制层测试所驱动的 `dsh-fake-runtime` 二进制。CI 会对从 PyPI 下载的真实运行时可执行程序跑无密钥 smoke 层；本地缺少 `DSH_TEST_RUNTIME_EXE` 时该测试自行跳过。
+用 `cargo fmt --all`、`cargo clippy --all-targets --features test-support -- -D warnings` 与 `cargo test --features test-support` 构建和测试；`test-support` feature 构建机制层测试所驱动的 `dsh-fake-runtime` 二进制。格式设置位于 `rustfmt.toml`；Clippy 启用 pedantic 组，并对内部 panic 不变量与文档 section 样板做少量有注释的豁免。CI 会对从 PyPI 下载的真实运行时可执行程序跑无密钥 smoke 层；本地缺少 `DSH_TEST_RUNTIME_EXE` 时该测试自行跳过。

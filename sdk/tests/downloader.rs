@@ -1,4 +1,4 @@
-//! Downloader tests: a local wheel server stands in for the PyPI index. The
+//! Downloader tests: a local wheel server stands in for the `PyPI` index. The
 //! served "runtime executable" is the `dsh-fake-runtime` binary itself, so the
 //! resolved runtime also drives real turns end-to-end.
 

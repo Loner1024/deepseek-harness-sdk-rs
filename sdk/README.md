@@ -201,7 +201,7 @@ cargo clippy --all-targets --features test-support -- -D warnings
 cargo test --features test-support
 ```
 
-The `test-support` feature builds the `dsh-fake-runtime` test binary that the mechanism-tier tests drive through real pipes; run the tests with the feature enabled or the process-level tests fail with guidance. The keyless smoke tier (the real exe against a scripted Messages model) self-skips without `DSH_TEST_RUNTIME_EXE`; CI drives it against the runtime wheel downloaded from PyPI.
+The `test-support` feature builds the `dsh-fake-runtime` test binary that the mechanism-tier tests drive through real pipes; run the tests with the feature enabled or the process-level tests fail with guidance. Formatting settings live in `rustfmt.toml`; Clippy enables its pedantic group, and CI denies all warnings. The keyless smoke tier (the real exe against a scripted Messages model) self-skips without `DSH_TEST_RUNTIME_EXE`; CI drives it against the runtime wheel downloaded from PyPI.
 
 ## Known limitations and deferred work
 

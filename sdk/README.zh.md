@@ -201,7 +201,7 @@ cargo clippy --all-targets --features test-support -- -D warnings
 cargo test --features test-support
 ```
 
-`test-support` feature 构建 `dsh-fake-runtime` 测试二进制，机制层测试经真实管道驱动它；必须带该 feature 运行测试，否则进程级测试会以指引信息失败。无密钥 smoke 层（真实 exe 对脚本化 Messages 模型）在缺少 `DSH_TEST_RUNTIME_EXE` 时自行跳过；CI 会对从 PyPI 下载的运行时 wheel 驱动它。
+`test-support` feature 构建 `dsh-fake-runtime` 测试二进制，机制层测试经真实管道驱动它；必须带该 feature 运行测试，否则进程级测试会以指引信息失败。格式设置位于 `rustfmt.toml`；Clippy 启用 pedantic 组，CI 会把所有 warning 视为失败。无密钥 smoke 层（真实 exe 对脚本化 Messages 模型）在缺少 `DSH_TEST_RUNTIME_EXE` 时自行跳过；CI 会对从 PyPI 下载的运行时 wheel 驱动它。
 
 ## 已知限制与暂缓事项
 

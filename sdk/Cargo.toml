@@ -49,3 +49,11 @@ unsafe_op_in_unsafe_fn = "deny"
 
 [lints.clippy]
 all = "warn"
+# Pedantic is the strict group; targeted allows below keep internal
+# invariants and API-doc boilerplate from turning into noise.
+pedantic = "warn"
+# Public failure modes are documented in prose; requiring an `# Errors`
+# section on every internal helper adds boilerplate without a contract.
+missing_errors_doc = "allow"
+# Mutex poisoning is an internal invariant, not a caller-triggered panic.
+missing_panics_doc = "allow"

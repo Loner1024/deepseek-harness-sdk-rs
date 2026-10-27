@@ -541,14 +541,14 @@ async fn initialize_advertises_question_capability_and_approval_opt_in() {
             .payload
             .get("capabilities")
             .and_then(|value| value.get("userQuestions"))
-            .and_then(|value| value.as_bool()),
+            .and_then(serde_json::Value::as_bool),
         Some(true)
     );
     assert_eq!(
         notification
             .payload
             .get("approvalRequests")
-            .and_then(|value| value.as_bool()),
+            .and_then(serde_json::Value::as_bool),
         Some(true)
     );
     assert_eq!(
@@ -562,7 +562,7 @@ async fn initialize_advertises_question_capability_and_approval_opt_in() {
         notification
             .payload
             .get("maxTokens")
-            .and_then(|value| value.as_u64()),
+            .and_then(serde_json::Value::as_u64),
         Some(100)
     );
     client.close().await;
@@ -586,7 +586,7 @@ async fn approval_request_round_trips_one_shot_decisions() {
         notification
             .payload
             .get("approvalRequests")
-            .and_then(|value| value.as_bool()),
+            .and_then(serde_json::Value::as_bool),
         Some(true)
     );
     let request = client.next_request().await.expect("approval request");

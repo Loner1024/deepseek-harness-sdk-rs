@@ -1,6 +1,6 @@
 //! # deepseek-harness-sdk-rs
 //!
-//! Drive a DeepSeek Harness runtime from Rust. The SDK spawns the packaged
+//! Drive a `DeepSeek` Harness runtime from Rust. The SDK spawns the packaged
 //! `dsh` CLI (`--profile sdk`) as a subprocess and speaks the line-delimited
 //! JSON-RPC 2.0 protocol over its stdio
 //! ([protocol reference](https://github.com/deepseek-ai/deepseek-harness/blob/master/packages/sdk/protocol/README.md));
@@ -27,7 +27,7 @@
 //! Managed launches require an explicit Harness home (`dsh_home` or a
 //! non-empty `DSH_HOME`); the SDK never discovers `~/.dsh`. Without any launch configuration the
 //! `runtime-download` feature (on by default) fetches the platform runtime
-//! wheel from PyPI, verifies its SHA-256 digest, and caches the executable
+//! wheel from `PyPI`, verifies its SHA-256 digest, and caches the executable
 //! and its sidecars. Callers who spawn their own runtime pass `runtime_bin`
 //! or `launch_args_override` and can disable the feature. A blocking facade
 //! ([`DeepSeekHarnessSync`]) covers synchronous callers.
@@ -52,7 +52,7 @@ pub(crate) fn resolve_path(path: &Path) -> PathBuf {
         return std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     }
     let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
-    let normalized = collapse_dot_components(absolute);
+    let normalized = collapse_dot_components(&absolute);
     if normalized.exists() {
         return normalized.canonicalize().unwrap_or(normalized);
     }
@@ -79,7 +79,7 @@ pub(crate) fn resolve_path(path: &Path) -> PathBuf {
 
 /// Lexically collapse `.` and `..` components, clamping `..` at the root the
 /// way `Path.resolve()` does. No filesystem access.
-fn collapse_dot_components(path: PathBuf) -> PathBuf {
+fn collapse_dot_components(path: &Path) -> PathBuf {
     let mut collapsed = PathBuf::new();
     for component in path.components() {
         match component {

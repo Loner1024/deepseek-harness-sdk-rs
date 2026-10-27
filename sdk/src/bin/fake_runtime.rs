@@ -42,6 +42,7 @@ use std::io::{BufRead, BufReader, BufWriter, Write};
 use serde_json::{Value, json};
 
 #[tokio::main(flavor = "current_thread")]
+#[allow(clippy::too_many_lines)]
 async fn main() {
     let mut args = std::env::args().skip(1);
     let mut scenario = None;
@@ -538,7 +539,7 @@ async fn main() {
                     respond(&mut stdout, &id, params.cloned().unwrap_or(Value::Null));
                 }
                 "ticks" if method.starts_with("emit-") => {
-                    notify(&mut stdout, "tick", &json!({"source": method}))
+                    notify(&mut stdout, "tick", &json!({"source": method}));
                 }
                 _ => respond_error(
                     &mut stdout,
@@ -557,6 +558,8 @@ fn write_line(stdout: &mut BufWriter<std::io::Stdout>, frame: &Value) {
     stdout.flush().ok();
 }
 
+// Test helpers accept owned JSON so call sites can pass `json!` directly.
+#[allow(clippy::needless_pass_by_value)]
 fn respond(stdout: &mut BufWriter<std::io::Stdout>, id: &str, result: Value) {
     write_line(
         stdout,
@@ -564,6 +567,7 @@ fn respond(stdout: &mut BufWriter<std::io::Stdout>, id: &str, result: Value) {
     );
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn respond_error(stdout: &mut BufWriter<std::io::Stdout>, id: &str, error: Value) {
     write_line(stdout, &json!({"jsonrpc": "2.0", "id": id, "error": error}));
 }

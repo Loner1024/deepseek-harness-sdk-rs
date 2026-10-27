@@ -21,9 +21,10 @@ async fn main() -> Result<(), SdkError> {
     let task = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "Say hello.".to_string());
-    let dsh_home = std::env::var_os("DSH_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::temp_dir().join("dsh-sdk-example-home"));
+    let dsh_home = std::env::var_os("DSH_HOME").map_or_else(
+        || std::env::temp_dir().join("dsh-sdk-example-home"),
+        PathBuf::from,
+    );
     let harness = DeepSeekHarness::new(DeepSeekHarnessConfig {
         dsh_home: Some(dsh_home),
         ..Default::default()

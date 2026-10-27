@@ -90,6 +90,7 @@ pub(crate) struct Peer {
 impl Peer {
     /// Attach the transport to the runtime's stdin/stdout and start the
     /// reader and writer tasks.
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn start<R, W>(
         mut stdin: W,
         stdout: R,
@@ -121,10 +122,9 @@ impl Peer {
         tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
             loop {
-                let line = match lines.next_line().await {
-                    Ok(Some(line)) => line,
-                    // EOF or a read error both mean the runtime is gone.
-                    Ok(None) | Err(_) => break,
+                // EOF or a read error both mean the runtime is gone.
+                let Ok(Some(line)) = lines.next_line().await else {
+                    break;
                 };
                 let Ok(message) = serde_json::from_str::<Value>(&line) else {
                     continue;
@@ -240,7 +240,7 @@ impl Peer {
                             let _ = slot.tx.send(SubMsg::Notification(notification));
                         }
                     }
-                    (false, None) => continue,
+                    (false, None) => {}
                 }
             }
             reader_shared.eof.notify_one();
@@ -299,7 +299,7 @@ impl Peer {
             ("id".to_string(), id.clone()),
             ("result".to_string(), result),
         ]);
-        self.send_frame(frame)
+        self.send_frame(&frame)
     }
 
     /// Answer a server-to-client request with an error frame.
@@ -325,12 +325,12 @@ impl Peer {
             ("id".to_string(), id.clone()),
             ("error".to_string(), Value::Object(error)),
         ]);
-        self.send_frame(frame)
+        self.send_frame(&frame)
     }
 
     /// Write one response frame to the runtime's stdin.
-    fn send_frame(&self, frame: Map<String, Value>) -> Result<(), SdkError> {
-        let frame = serde_json::to_string(&frame).expect("json value serialization cannot fail");
+    fn send_frame(&self, frame: &Map<String, Value>) -> Result<(), SdkError> {
+        let frame = serde_json::to_string(frame).expect("json value serialization cannot fail");
         if self.out_tx.send(OutFrame::Line(frame)).is_err() {
             return Err(self.closed_error().unwrap_or_else(|| {
                 SdkError::transport_closed("DeepSeek Harness runtime stdin closed", None, &[])
@@ -392,15 +392,16 @@ impl Peer {
             }
         };
         match timeout {
-            Some(timeout) => match tokio::time::timeout(timeout, wait).await {
-                Ok(result) => result,
-                Err(_) => {
+            Some(timeout) => {
+                if let Ok(result) = tokio::time::timeout(timeout, wait).await {
+                    result
+                } else {
                     self.pending.lock().await.remove(&id);
                     Err(SdkError::RequestTimeout {
                         message: format!("{method} timed out waiting for DeepSeek Harness runtime"),
                     })
                 }
-            },
+            }
             None => wait.await,
         }
     }
@@ -477,7 +478,8 @@ impl Peer {
     /// Record the terminal error once, fail every pending request with it,
     /// and push it to every subscriber and the incoming-request queue.
     /// Idempotent: only the first error wins.
-    pub(crate) fn fail_closed(&self, error: SdkError) {
+    pub(crate) fn fail_closed(&self, error: &SdkError) {
+        let error = error.clone();
         {
             let mut slot = self.shared.closed_err.lock().unwrap();
             if slot.is_none() {

@@ -3,13 +3,14 @@
 //! digest, and extracts the packaged `dsh` executable, its sidecars, and the
 //! platform resource directory into a versioned cache.
 //!
-//! The build workflow retains platform wheels and nothing else, so PyPI is
+//! The build workflow retains platform wheels and nothing else, so `PyPI` is
 //! the only published artifact stream carrying the runtime executable today.
 
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
+use sha2::Digest;
 
 use crate::error::SdkError;
 
@@ -38,7 +39,7 @@ struct Platform {
     exe_name: &'static str,
 }
 
-/// Normalize a semver pre-release to PEP 440 spelling for PyPI queries:
+/// Normalize a semver pre-release to PEP 440 spelling for `PyPI` queries:
 /// cargo spells `0.2.1-rc.2` while the wheel index spells `0.2.1rc2`.
 fn to_pypi_version(version: &str) -> String {
     for (from, to) in [("-rc.", "rc"), ("-beta.", "b"), ("-alpha.", "a")] {
@@ -238,7 +239,6 @@ fn verify_digest(bytes: &[u8], expected_hex: &str) -> Result<(), SdkError> {
     let expected = hex::decode(expected_hex).map_err(|error| SdkError::RuntimeResolve {
         message: format!("invalid sha256 digest {expected_hex:?}: {error}"),
     })?;
-    use sha2::Digest;
     let actual = sha2::Sha256::digest(bytes);
     if actual.as_slice() != expected.as_slice() {
         return Err(SdkError::RuntimeResolve {
@@ -254,6 +254,7 @@ const RUNTIME_PREFIX: &str = "deepseek_harness_runtime/runtime/";
 /// Extract the executable, sidecars, and platform resources into the cache
 /// directory; the `.complete` marker is written last so an interrupted
 /// extraction never reads as a valid cache.
+#[allow(clippy::too_many_lines)]
 fn extract(cache_dir: &Path, platform: &Platform, bytes: &[u8]) -> Result<(), SdkError> {
     let staging = cache_dir.with_file_name(format!(
         "{}.tmp-{}-{}",
@@ -308,7 +309,7 @@ fn extract(cache_dir: &Path, platform: &Platform, bytes: &[u8]) -> Result<(), Sd
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                let mode = mode.map(|mode| mode & 0o777).unwrap_or(0o644);
+                let mode = mode.map_or(0o644, |mode| mode & 0o777);
                 let mode = if mode & 0o111 != 0 { mode } else { 0o644 };
                 std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(mode))?;
             }

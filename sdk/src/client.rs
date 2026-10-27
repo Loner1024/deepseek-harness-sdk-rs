@@ -201,6 +201,7 @@ impl UserQuestionCancellation {
     }
 
     /// Whether the runtime cancelled the question or the client closed.
+    #[must_use]
     pub fn is_cancelled(&self) -> bool {
         self.inner.cancelled.load(Ordering::SeqCst)
     }
@@ -379,6 +380,7 @@ const STDERR_TAIL_LINES: usize = 400;
 impl HarnessClient {
     /// Build a client for the given launch options. The runtime subprocess
     /// starts lazily on [`Self::start`].
+    #[must_use]
     pub fn new(options: HarnessClientOptions) -> Self {
         Self {
             inner: Arc::new(ClientInner {
@@ -475,11 +477,12 @@ impl HarnessClient {
                 task.cancellation.cancel();
             }
             let tail: Vec<String> = monitor_tail.lock().unwrap().iter().cloned().collect();
-            monitor_peer.fail_closed(SdkError::transport_closed(
+            let error = SdkError::transport_closed(
                 "DeepSeek Harness runtime stdout closed",
                 exit_code,
                 &tail,
-            ));
+            );
+            monitor_peer.fail_closed(&error);
         });
 
         *self.inner.state.lock().await = Some(ClientState {
@@ -734,7 +737,10 @@ impl HarnessClient {
         parts.join("\n")
     }
 
+    // Keep the three send methods async for a uniform client surface and to
+    // leave room for writer backpressure without another breaking change.
     /// Send one notification frame to the runtime.
+    #[allow(clippy::unused_async)]
     pub async fn notify(&self, method: &str, params: Option<Value>) -> Result<(), SdkError> {
         self.peer()?.notify(method, params)
     }
@@ -755,12 +761,14 @@ impl HarnessClient {
     }
 
     /// Answer a server-to-client request with a result frame.
+    #[allow(clippy::unused_async)]
     pub async fn respond(&self, id: &Value, result: Value) -> Result<(), SdkError> {
         self.peer()?.respond(id, result)
     }
 
     /// Answer a server-to-client request with an error frame; `data` rides
     /// the error object when present.
+    #[allow(clippy::unused_async)]
     pub async fn respond_error(
         &self,
         id: &Value,
@@ -844,12 +852,9 @@ impl HarnessClient {
             Self::join_question_tasks(question_tasks).await;
             return;
         };
-        let peer = match self.inner.peer.get() {
-            Some(peer) => peer.clone(),
-            None => {
-                Self::join_question_tasks(question_tasks).await;
-                return;
-            }
+        let Some(peer) = self.inner.peer.get().cloned() else {
+            Self::join_question_tasks(question_tasks).await;
+            return;
         };
         let timeout = Duration::from_secs_f64(self.inner.options.shutdown_timeout_seconds.max(0.0));
 
@@ -875,13 +880,12 @@ impl HarnessClient {
                 }
                 #[cfg(not(unix))]
                 let _ = child.start_kill();
-                match tokio::time::timeout(timeout, child.wait()).await {
-                    Ok(Ok(status)) => exit_code = status.code(),
-                    _ => {
-                        let _ = child.start_kill();
-                        if let Ok(status) = child.wait().await {
-                            exit_code = status.code();
-                        }
+                if let Ok(Ok(status)) = tokio::time::timeout(timeout, child.wait()).await {
+                    exit_code = status.code();
+                } else {
+                    let _ = child.start_kill();
+                    if let Ok(status) = child.wait().await {
+                        exit_code = status.code();
                     }
                 }
             }
@@ -897,11 +901,8 @@ impl HarnessClient {
             .iter()
             .cloned()
             .collect();
-        peer.fail_closed(SdkError::transport_closed(
-            "DeepSeek Harness runtime closed",
-            exit_code,
-            &tail,
-        ));
+        let error = SdkError::transport_closed("DeepSeek Harness runtime closed", exit_code, &tail);
+        peer.fail_closed(&error);
         for task in state.tasks {
             task.abort();
         }
@@ -1018,31 +1019,28 @@ impl HarnessClient {
             }
         }
         if resolved.managed {
-            match &self.inner.options.dsh_home {
-                Some(home) => {
-                    if home.as_os_str().is_empty() {
-                        return Err(SdkError::Config {
-                            message: "dsh_home must not be empty".into(),
-                        });
-                    }
-                    let home = crate::resolve_path(home);
-                    let home = home.to_str().ok_or_else(|| SdkError::Config {
-                        message: format!("dsh_home is not valid UTF-8: {}", home.display()),
-                    })?;
-                    env.insert("DSH_HOME".into(), home.into());
+            if let Some(home) = &self.inner.options.dsh_home {
+                if home.as_os_str().is_empty() {
+                    return Err(SdkError::Config {
+                        message: "dsh_home must not be empty".into(),
+                    });
                 }
-                None => {
-                    let configured = env
-                        .get(std::ffi::OsStr::new("DSH_HOME"))
-                        .and_then(|value| value.to_str())
-                        .is_some_and(|value| !value.trim().is_empty());
-                    if !configured {
-                        return Err(SdkError::Config {
-                            message: "managed launches require an explicit dsh_home or a \
-                                      non-empty DSH_HOME; the Rust SDK never discovers ~/.dsh"
-                                .into(),
-                        });
-                    }
+                let home = crate::resolve_path(home);
+                let home = home.to_str().ok_or_else(|| SdkError::Config {
+                    message: format!("dsh_home is not valid UTF-8: {}", home.display()),
+                })?;
+                env.insert("DSH_HOME".into(), home.into());
+            } else {
+                let configured = env
+                    .get(std::ffi::OsStr::new("DSH_HOME"))
+                    .and_then(|value| value.to_str())
+                    .is_some_and(|value| !value.trim().is_empty());
+                if !configured {
+                    return Err(SdkError::Config {
+                        message: "managed launches require an explicit dsh_home or a \
+                                  non-empty DSH_HOME; the Rust SDK never discovers ~/.dsh"
+                            .into(),
+                    });
                 }
             }
         }
@@ -1104,6 +1102,7 @@ impl ClientInner {
     /// Dispatch one native question without blocking the reader. Returns
     /// whether this hook owns the request. Invalid batches and duplicate
     /// request ids receive `-32602`; handler failures receive `-32603`.
+    #[allow(clippy::too_many_lines)]
     fn dispatch_user_question(&self, request: &IncomingRequest) -> bool {
         if request.method != "user-question/ask" {
             return false;
@@ -1119,17 +1118,14 @@ impl ClientInner {
         let Some(peer) = self.peer.get().cloned() else {
             return false;
         };
-        let question = match UserQuestionRequest::from_payload(&request.payload) {
-            Ok(question) => question,
-            Err(()) => {
-                let _ = peer.respond_error(
-                    &request.id,
-                    -32602,
-                    "invalid user-question/ask parameters",
-                    None,
-                );
-                return true;
-            }
+        let Ok(question) = UserQuestionRequest::from_payload(&request.payload) else {
+            let _ = peer.respond_error(
+                &request.id,
+                -32602,
+                "invalid user-question/ask parameters",
+                None,
+            );
+            return true;
         };
         let cancellation = UserQuestionCancellation::new();
         let incoming_id = request.id.clone();
@@ -1158,7 +1154,7 @@ impl ClientInner {
                 tokio::spawn(handler.call(task_question, task_cancellation.clone()));
             let outcome = tokio::select! {
                 outcome = &mut handler_task => Some(outcome),
-                _ = task_cancellation.cancelled() => None,
+                () = task_cancellation.cancelled() => None,
             };
             if let Some(outcome) = outcome
                 && !task_cancellation.is_cancelled()

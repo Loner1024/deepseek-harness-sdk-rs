@@ -78,4 +78,4 @@ This repository is the standalone home of the Rust SDK. The runtime it drives is
 
 ## Contributor workflow
 
-Build and test with `cargo fmt --all`, `cargo clippy --all-targets --features test-support -- -D warnings`, and `cargo test --features test-support`; the `test-support` feature builds the `dsh-fake-runtime` binary the mechanism-tier tests drive. CI runs the keyless smoke tier against the real runtime executable downloaded from PyPI; locally it self-skips without `DSH_TEST_RUNTIME_EXE`.
+Build and test with `cargo fmt --all`, `cargo clippy --all-targets --features test-support -- -D warnings`, and `cargo test --features test-support`; the `test-support` feature builds the `dsh-fake-runtime` binary the mechanism-tier tests drive. Formatting settings live in `rustfmt.toml`; Clippy enables its pedantic group, with narrow documented allows for internal panic invariants and doc-section boilerplate. CI runs the keyless smoke tier against the real runtime executable downloaded from PyPI; locally it self-skips without `DSH_TEST_RUNTIME_EXE`.

@@ -28,11 +28,10 @@ use serde_json::Value;
 async fn main() {
     let (topic, session_id, runtime_bin) = parse_args();
 
-    let dsh_home = std::env::var_os("DSH_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            std::env::temp_dir().join(format!("deep-research-{}", uuid::Uuid::new_v4().simple()))
-        });
+    let dsh_home = std::env::var_os("DSH_HOME").map_or_else(
+        || std::env::temp_dir().join(format!("deep-research-{}", uuid::Uuid::new_v4().simple())),
+        PathBuf::from,
+    );
     if let Err(error) = std::fs::create_dir_all(&dsh_home) {
         eprintln!(
             "error: cannot create Harness home {}: {error}",
@@ -111,13 +110,13 @@ fn parse_args() -> (String, Option<String>, Option<PathBuf>) {
             "--session" => {
                 session_id = args
                     .next()
-                    .or_else(|| fail("--session needs a value".into()))
+                    .or_else(|| fail("--session needs a value".into()));
             }
             "--runtime-bin" => {
                 runtime_bin = args
                     .next()
                     .map(PathBuf::from)
-                    .or_else(|| fail("--runtime-bin needs a value".into()))
+                    .or_else(|| fail("--runtime-bin needs a value".into()));
             }
             flag if flag.starts_with("--") => fail(format!("unknown flag {flag}")),
             other if topic.is_none() => topic = Some(other.to_string()),

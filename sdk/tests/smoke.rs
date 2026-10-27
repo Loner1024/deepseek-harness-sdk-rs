@@ -41,7 +41,7 @@ async fn real_runtime_completes_one_turn_through_a_scripted_model() {
         ..Default::default()
     });
     let result = tokio::time::timeout(
-        Duration::from_secs(180),
+        Duration::from_mins(3),
         harness.run("reply exactly", &RunOptions::default()),
     )
     .await
@@ -82,7 +82,7 @@ async fn real_runtime_resumes_a_persisted_session() {
 
     let first = DeepSeekHarness::new(config());
     let result = tokio::time::timeout(
-        Duration::from_secs(180),
+        Duration::from_mins(3),
         first.run("start a persisted session", &RunOptions::default()),
     )
     .await
@@ -92,7 +92,7 @@ async fn real_runtime_resumes_a_persisted_session() {
 
     let second = DeepSeekHarness::new(config());
     let session = tokio::time::timeout(
-        Duration::from_secs(180),
+        Duration::from_mins(3),
         second.resume_session(&result.session_id),
     )
     .await
@@ -100,7 +100,7 @@ async fn real_runtime_resumes_a_persisted_session() {
     .expect("resume failed");
     assert_eq!(session.id(), result.session_id);
     let resumed = tokio::time::timeout(
-        Duration::from_secs(180),
+        Duration::from_mins(3),
         session.run("continue the task", None),
     )
     .await
@@ -136,7 +136,7 @@ fn contains_session_log(dir: &std::path::Path) -> bool {
 }
 
 /// A minimal scripted model: every completion request gets the fixed text
-/// completion streamed as a DeepSeek Messages event stream.
+/// completion streamed as a `DeepSeek` Messages event stream.
 fn start_mock_server() -> String {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let port = listener.local_addr().expect("addr").port();
